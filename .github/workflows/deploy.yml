@@ -24,7 +24,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::206135621036:role/one-dev-backend-2-task
+          role-to-assume: arn:aws:iam::206135621036:role/one-dev-github-deploy-backend-2
           aws-region: ${{ env.AWS_REGION }}
           audience: sts.amazonaws.com
 
