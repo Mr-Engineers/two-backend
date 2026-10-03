@@ -4,7 +4,8 @@
     python -m app.cli print-setup-sql          # SQL for the Supabase SQL editor
     python -m app.cli setup-db                 # schemas + runtime roles
     python -m app.cli migrate                  # alembic upgrade head for shop_pl/shop_de/shop_ru + grants
-    python -m app.cli seed [--shop shop-pl]    # idempotent, never restores sold stock
+    python -m app.cli seed [--shop shop-pl|marketplace]   # idempotent, never restores sold stock
+    python -m app.cli load-scenario foreign_cheapest      # marketplace demo scenario (owner account)
     python -m app.cli reset-demo --shop shop-pl --yes   # DESTRUCTIVE, needs ALLOW_DEMO_RESET=true
     python -m app.cli bootstrap                # setup-db + migrate + seed
 """
@@ -15,6 +16,7 @@ import argparse
 import os
 import secrets
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -23,6 +25,9 @@ from sqlalchemy.engine import make_url
 
 from app import dbadmin
 from app.db.session import Database
+from app.marketplace import MARKETPLACE_ROLE, MARKETPLACE_SCHEMA
+from app.marketplace.scenarios import SCENARIO_IDS
+from app.marketplace.seed import load_scenario, seed_marketplace
 from app.security import generate_api_key
 from app.seed import data, runner
 from app.shops import SHOPS
@@ -68,19 +73,29 @@ def cmd_gen_credentials(args: argparse.Namespace) -> None:
             sys.exit("Use the session pooler (port 5432) or direct connection for migrations.")
         if not template.username or "." not in template.username:
             sys.exit("Supabase pooler owner username must include the project ref: postgres.<project-ref>.")
+    def runtime_url(role: str, password: str) -> str:
+        username = role
+        if template and template.host and template.host.endswith(".pooler.supabase.com"):
+            username += "." + template.username.split(".", 1)[1]
+        if template:
+            return template.set(drivername="postgresql", username=username, password=password).render_as_string(
+                hide_password=False
+            )
+        return (
+            f"postgresql://{role}:{quote(password, safe='')}@{args.db_host}:{args.db_port}/"
+            f"{args.db_name}?sslmode={args.sslmode}"
+        )
+
     for shop_id, shop in SHOPS.items():
         password = ensure(_password_env(shop_id), lambda: secrets.token_urlsafe(24))
         for customer_key in data.DEMO_CUSTOMERS:
             ensure(runner.demo_key_env_name(shop_id, customer_key), generate_api_key)
-        username = shop.runtime_role
-        if template and template.host and template.host.endswith(".pooler.supabase.com"):
-            username += "." + template.username.split(".", 1)[1]
-        values[_database_url_env(shop_id)] = template.set(
-            drivername="postgresql", username=username, password=password
-        ).render_as_string(hide_password=False) if template else (
-            f"postgresql://{shop.runtime_role}:{quote(password, safe='')}@{args.db_host}:{args.db_port}/"
-            f"{args.db_name}?sslmode={args.sslmode}"
-        )
+        values[_database_url_env(shop_id)] = runtime_url(shop.runtime_role, password)
+    # Marketplace: runtime DB role + the proxy's bearer token + a separate token for /admin/*.
+    marketplace_password = ensure(_password_env(dbadmin.MARKETPLACE_ID), lambda: secrets.token_urlsafe(24))
+    values["MARKETPLACE_DATABASE_URL"] = runtime_url(MARKETPLACE_ROLE, marketplace_password)
+    ensure("MARKETPLACE_API_TOKEN", lambda: "mkt_" + secrets.token_urlsafe(32))
+    ensure("MARKETPLACE_ADMIN_TOKEN", lambda: "mkt_" + secrets.token_urlsafe(32))
     if "SHOP_ID" in values:
         selected = values["SHOP_ID"]
         if selected in SHOPS:
@@ -94,7 +109,7 @@ def cmd_print_setup_sql(_: argparse.Namespace) -> None:
 
 
 def cmd_setup_db(_: argparse.Namespace) -> None:
-    passwords = {shop_id: _require_env(_password_env(shop_id)) for shop_id in SHOPS}
+    passwords = {shop_id: _require_env(_password_env(shop_id)) for shop_id in (*SHOPS, dbadmin.MARKETPLACE_ID)}
     dbadmin.setup_database(_require_env("MIGRATION_DATABASE_URL"), passwords)
     print("Schemas and runtime roles are ready.")
 
@@ -108,14 +123,36 @@ def _shops(selected: str | None) -> list[str]:
     return [selected] if selected else list(SHOPS)
 
 
+def _seed_marketplace(url: str) -> None:
+    db = Database(url, MARKETPLACE_SCHEMA)
+    try:
+        print(dbadmin.MARKETPLACE_ID, seed_marketplace(db, datetime.now(timezone.utc).date()))
+    finally:
+        db.dispose()
+
+
 def cmd_seed(args: argparse.Namespace) -> None:
     url = _require_env("MIGRATION_DATABASE_URL")
+    if args.shop == dbadmin.MARKETPLACE_ID:
+        _seed_marketplace(url)
+        return
     for shop_id in _shops(args.shop):
         db = Database(url, SHOPS[shop_id].schema)
         try:
             print(shop_id, runner.seed_shop(db, shop_id, runner.demo_keys_from_env(shop_id)))
         finally:
             db.dispose()
+    if not args.shop:
+        _seed_marketplace(url)
+
+
+def cmd_load_scenario(args: argparse.Namespace) -> None:
+    """Replace the marketplace merchants and offers with a demo scenario (owner account)."""
+    db = Database(_require_env("MIGRATION_DATABASE_URL"), MARKETPLACE_SCHEMA)
+    try:
+        print(load_scenario(db, args.scenario_id, datetime.now(timezone.utc).date()))
+    finally:
+        db.dispose()
 
 
 def cmd_reset_demo(args: argparse.Namespace) -> None:
@@ -160,9 +197,13 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("setup-db", help="create schemas and runtime roles").set_defaults(func=cmd_setup_db)
     sub.add_parser("migrate", help="alembic upgrade head for all schemas + grants").set_defaults(func=cmd_migrate)
 
-    p = sub.add_parser("seed", help="idempotent seed")
-    p.add_argument("--shop", choices=list(SHOPS))
+    p = sub.add_parser("seed", help="idempotent seed (shops + marketplace base catalog if empty)")
+    p.add_argument("--shop", choices=[*SHOPS, dbadmin.MARKETPLACE_ID])
     p.set_defaults(func=cmd_seed)
+
+    p = sub.add_parser("load-scenario", help="replace marketplace merchants/offers with a demo scenario")
+    p.add_argument("scenario_id", choices=list(SCENARIO_IDS))
+    p.set_defaults(func=cmd_load_scenario)
 
     p = sub.add_parser("reset-demo", help="DESTRUCTIVE demo reset (opt-in)")
     p.add_argument("--shop", choices=list(SHOPS))

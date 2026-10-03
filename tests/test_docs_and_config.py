@@ -29,10 +29,10 @@ def test_env_example_has_no_secrets():
     text = (ROOT / ".env.example").read_text(encoding="utf-8")
     assert "shk_" not in text
     for line in text.splitlines():
-        if line.startswith(("DATABASE_URL", "MIGRATION_DATABASE_URL")):
+        if line.startswith(("DATABASE_URL", "MIGRATION_DATABASE_URL", "MARKETPLACE_DATABASE_URL")):
             value = line.split("=", 1)[1].split("#", 1)[0].strip()
             assert value == "", line
-        if re.match(r"(SHOP_\w+_DB_PASSWORD|DEMO_API_KEY_\w+)=", line):
+        if re.match(r"(SHOP_\w+_DB_PASSWORD|MARKETPLACE_DB_PASSWORD|MARKETPLACE_\w+_TOKEN|DEMO_API_KEY_\w+)=", line):
             assert line.split("=", 1)[1].strip() == "", line
 
 

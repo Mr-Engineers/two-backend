@@ -18,6 +18,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from app.config import normalize_database_url
+from app.marketplace import MARKETPLACE_DEV_PORT, MARKETPLACE_ROLE, MARKETPLACE_SCHEMA
 from app.shops import SHOPS, ShopDefinition
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -95,9 +96,9 @@ def setup_statements(shop: ShopDefinition, password: str | None, *, placeholder:
     ]
 
 
-def grants_statements(shop: ShopDefinition) -> list[str]:
-    s, r = shop.schema, shop.runtime_role
-    stmts = [
+def _baseline_grant_statements(s: str, r: str) -> list[str]:
+    """Revoke everything from PUBLIC / Supabase Data API roles / the runtime role, then allow schema USAGE."""
+    return [
         f'REVOKE ALL ON SCHEMA "{s}" FROM PUBLIC',
         f'REVOKE ALL ON ALL TABLES IN SCHEMA "{s}" FROM PUBLIC',
         f'REVOKE ALL ON ALL SEQUENCES IN SCHEMA "{s}" FROM PUBLIC',
@@ -114,6 +115,11 @@ def grants_statements(shop: ShopDefinition) -> list[str]:
         f'REVOKE ALL ON ALL TABLES IN SCHEMA "{s}" FROM "{r}"',
         f'GRANT USAGE ON SCHEMA "{s}" TO "{r}"',
     ]
+
+
+def grants_statements(shop: ShopDefinition) -> list[str]:
+    s, r = shop.schema, shop.runtime_role
+    stmts = _baseline_grant_statements(s, r)
     for table, privileges in RUNTIME_GRANTS.items():
         stmts.append(f'GRANT {privileges} ON "{s}"."{table}" TO "{r}"')
     stmts.append(f'GRANT UPDATE (stock_quantity) ON "{s}"."products" TO "{r}"')
@@ -122,10 +128,11 @@ def grants_statements(shop: ShopDefinition) -> list[str]:
 
 
 def setup_database(admin_url: str, passwords: Mapping[str, str | None]) -> None:
-    """Create schemas and runtime roles. ``passwords`` maps shop_id -> runtime password."""
+    """Create schemas and runtime roles. ``passwords`` maps shop_id (and ``marketplace``) -> runtime password."""
     statements: list[str] = []
     for shop_id, shop in SHOPS.items():
         statements.extend(setup_statements(shop, passwords.get(shop_id)))
+    statements.extend(marketplace_setup_statements(passwords.get(MARKETPLACE_ID)))
     _run_statements(admin_url, statements)
 
 
@@ -136,8 +143,68 @@ def apply_grants(admin_url: str) -> None:
     _run_statements(admin_url, statements)
 
 
+# ---------------------------------------------------------------------------------------- marketplace
+MARKETPLACE_ID = "marketplace"
+
+# The marketplace runtime role may only change what the API needs: orders + idempotency records are insert-only,
+# available_qty is the only offer column that may be updated, merchants/offers can be replaced by the demo loader.
+MARKETPLACE_RUNTIME_GRANTS: dict[str, str] = {
+    "alembic_version": "SELECT",
+    "merchants": "SELECT, INSERT, DELETE",
+    "offers": "SELECT, INSERT, DELETE",
+    "orders": "SELECT, INSERT",
+    "idempotency_records": "SELECT, INSERT",
+}
+
+
+def _marketplace_shop_like() -> ShopDefinition:
+    """The marketplace schema/role reuse the shop role+schema DDL; only the names differ."""
+    return ShopDefinition(
+        shop_id=MARKETPLACE_ID, schema=MARKETPLACE_SCHEMA, runtime_role=MARKETPLACE_ROLE,
+        name="Marketplace", country="PL", currency="PLN", locale="pl-PL", order_prefix="MP",
+        dev_port=MARKETPLACE_DEV_PORT,
+    )
+
+
+def marketplace_setup_statements(password: str | None, *, placeholder: bool = False) -> list[str]:
+    return setup_statements(_marketplace_shop_like(), password, placeholder=placeholder)
+
+
+def marketplace_grants_statements() -> list[str]:
+    s, r = MARKETPLACE_SCHEMA, MARKETPLACE_ROLE
+    stmts = _baseline_grant_statements(s, r)
+    for table, privileges in MARKETPLACE_RUNTIME_GRANTS.items():
+        stmts.append(f'GRANT {privileges} ON "{s}"."{table}" TO "{r}"')
+    stmts.append(f'GRANT UPDATE (available_qty) ON "{s}"."offers" TO "{r}"')
+    return stmts
+
+
+def apply_marketplace_grants(admin_url: str) -> None:
+    _run_statements(admin_url, marketplace_grants_statements())
+
+
+def migrate_marketplace(admin_url: str) -> None:
+    cfg = Config()
+    cfg.set_main_option("script_location", str(ROOT / "migrations_marketplace"))
+    cfg.set_main_option("prepend_sys_path", str(ROOT))
+    cfg.attributes["migration_url"] = admin_url
+    command.upgrade(cfg, "head")
+    apply_marketplace_grants(admin_url)
+
+
+def marketplace_head_revision() -> str:
+    from alembic.script import ScriptDirectory
+
+    cfg = Config()
+    cfg.set_main_option("script_location", str(ROOT / "migrations_marketplace"))
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+    assert head is not None
+    return head
+
+
 def migrate(admin_url: str, schema: str | None = None) -> None:
-    """alembic upgrade head for every shop schema (or one), then (re)apply runtime grants."""
+    """alembic upgrade head for every shop schema (or one), then (re)apply runtime grants.
+    The marketplace schema is migrated too unless a single shop ``schema`` is selected."""
     cfg = Config(str(ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "migrations"))
     cfg.attributes["migration_url"] = admin_url
@@ -145,6 +212,8 @@ def migrate(admin_url: str, schema: str | None = None) -> None:
         cfg.cmd_opts = argparse.Namespace(x=[f"schema={schema}"])
     command.upgrade(cfg, "head")
     apply_grants(admin_url)
+    if not schema:
+        migrate_marketplace(admin_url)
 
 
 def head_revision() -> str:
@@ -163,10 +232,14 @@ def render_setup_sql() -> str:
     for shop in SHOPS.values():
         parts.append(f"\n-- {shop.shop_id}")
         parts.extend(stmt + ";" for stmt in setup_statements(shop, None, placeholder=True))
+    parts.append(f"\n-- {MARKETPLACE_ID}")
+    parts.extend(stmt + ";" for stmt in marketplace_setup_statements(None, placeholder=True))
     parts.append("\n-- After `alembic upgrade head` run (python -m app.cli migrate does it automatically):")
     for shop in SHOPS.values():
         parts.append(f"\n-- {shop.shop_id} grants")
         parts.extend(stmt + ";" for stmt in grants_statements(shop))
+    parts.append(f"\n-- {MARKETPLACE_ID} grants")
+    parts.extend(stmt + ";" for stmt in marketplace_grants_statements())
     return "\n".join(parts) + "\n"
 
 
