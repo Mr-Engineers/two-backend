@@ -1,5 +1,5 @@
 """Integration test harness: a REAL PostgreSQL with the production layout
-(one database, three shop schemas + the marketplace schema, least-privilege runtime roles, Alembic migrations, seed).
+(one database, three schemas, three least-privilege runtime roles, Alembic migrations, seed).
 
 Database source:
   * TEST_DATABASE_ADMIN_URL (owner account of a throw-away database, e.g. the Compose Postgres), or
@@ -27,7 +27,6 @@ from app import dbadmin
 from app.config import Settings
 from app.db.session import Database
 from app.main import create_app
-from app.marketplace import MARKETPLACE_SCHEMA
 from app.security import generate_api_key
 from app.seed import data, runner
 from app.services.shop import ShopService
@@ -102,11 +101,11 @@ def db_env(admin_url):
 
     url = admin_url.replace("postgresql://", "postgresql://", 1)
     with psycopg.connect(url, autocommit=True) as conn:
-        for schema in (*ALL_SCHEMAS, MARKETPLACE_SCHEMA):
+        for schema in ALL_SCHEMAS:
             conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
         for role in ("anon", "authenticated", "service_role"):  # Supabase-like Data API roles
             conn.execute(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='{role}') THEN CREATE ROLE {role} NOLOGIN; END IF; END $$")
-    passwords = {sid: secrets.token_urlsafe(12) for sid in (*SHOPS, dbadmin.MARKETPLACE_ID)}
+    passwords = {sid: secrets.token_urlsafe(12) for sid in SHOPS}
     keys = {sid: {k: generate_api_key() for k in data.DEMO_CUSTOMERS} for sid in SHOPS}
     dbadmin.setup_database(admin_url, passwords)
     dbadmin.migrate(admin_url)

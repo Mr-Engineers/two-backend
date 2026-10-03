@@ -1,5 +1,4 @@
-"""Engine / session factory. One engine per process, bound to one schema from the fixed shop list
-(or to the fixed ``marketplace`` schema)."""
+"""Engine / session factory. One engine per process, bound to one schema from the fixed shop list."""
 
 from __future__ import annotations
 
@@ -10,7 +9,6 @@ from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import normalize_database_url
-from app.marketplace import MARKETPLACE_SCHEMA
 from app.shops import ALL_SCHEMAS
 
 
@@ -25,8 +23,8 @@ class Database:
         pool_timeout: float = 10.0,
         connect_timeout: int = 5,
     ):
-        if schema not in ALL_SCHEMAS and schema != MARKETPLACE_SCHEMA:
-            raise ValueError(f"Schema {schema!r} is not one of the fixed shop or marketplace schemas")
+        if schema not in ALL_SCHEMAS:
+            raise ValueError(f"Schema {schema!r} is not one of the fixed shop schemas")
         self.schema = schema
         self.engine: Engine = create_engine(
             normalize_database_url(url),

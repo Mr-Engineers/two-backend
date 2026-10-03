@@ -1,8 +1,5 @@
 # Integration guide
 
-> This guide covers the three shops. The Marketplace API (offer search, orders, merchant profiles, demo scenarios)
-> is a separate service documented in [`marketplace.md`](marketplace.md).
-
 Three independent shop backends share one code base. Each is its own process/container with its own database
 schema, REST API and MCP endpoint.
 

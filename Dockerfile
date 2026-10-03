@@ -1,6 +1,5 @@
-# One image for all three shops and the marketplace API. The shop is chosen at start-up with SHOP_ID
-# (shop-pl | shop-de | shop-ru) and each container gets only ITS OWN runtime DATABASE_URL.
-# The marketplace overrides the command: uvicorn app.marketplace.main:create_app --factory (needs MARKETPLACE_DATABASE_URL).
+# One image for all three shops. The shop is chosen at start-up with SHOP_ID (shop-pl | shop-de | shop-ru)
+# and each container gets only ITS OWN runtime DATABASE_URL.
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -16,7 +15,6 @@ RUN pip install -r requirements.txt
 COPY alembic.ini ./
 COPY app ./app
 COPY migrations ./migrations
-COPY migrations_marketplace ./migrations_marketplace
 COPY scripts ./scripts
 
 RUN useradd --system --uid 10001 --no-create-home shop
