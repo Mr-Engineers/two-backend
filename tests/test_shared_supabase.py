@@ -7,6 +7,7 @@ from sqlalchemy.engine import make_url
 
 from app.cli import cmd_gen_credentials
 from app.dbadmin import setup_statements
+from app.marketplace import MARKETPLACE_ROLE
 from app.shops import SHOPS
 from scripts.run_shops import validate_shared_database
 
@@ -38,6 +39,25 @@ def test_credentials_share_owner_database(tmp_path, host, user):
         assert url.username == shop.runtime_role + (".example" if "pooler" in host else "")
         assert url.password == values[f"{shop_id.upper().replace('-', '_')}_DB_PASSWORD"]
     assert values["DATABASE_URL"] == values["DATABASE_URL_SHOP_DE"]
+
+    market = make_url(values["MARKETPLACE_DATABASE_URL"])
+    assert (market.host, market.port, market.database, market.query["sslmode"]) == (host, 5432, "postgres", "require")
+    assert market.username == MARKETPLACE_ROLE + (".example" if "pooler" in host else "")
+    assert market.password == values["MARKETPLACE_DB_PASSWORD"]
+    assert values["MARKETPLACE_API_TOKEN"].startswith("mkt_") and values["MARKETPLACE_ADMIN_TOKEN"].startswith("mkt_")
+    assert values["MARKETPLACE_API_TOKEN"] != values["MARKETPLACE_ADMIN_TOKEN"]
+
+
+def test_credentials_are_kept_when_regenerated(tmp_path):
+    path = tmp_path / ".env"
+    args = argparse.Namespace(
+        out=str(path), migration_url="postgresql://postgres:owner@127.0.0.1:5432/postgres",
+        db_host="127.0.0.1", db_port="5432", db_name="postgres", sslmode="prefer",
+    )
+    cmd_gen_credentials(args)
+    first = dotenv_values(path)
+    cmd_gen_credentials(args)
+    assert dotenv_values(path) == first
 
 
 def test_launcher_rejects_different_supabase_tenants(monkeypatch):
