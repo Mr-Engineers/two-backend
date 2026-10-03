@@ -102,6 +102,143 @@ credentials for a different database. Compose injects the generated values into 
 its own runtime `DATABASE_URL`). Then run `python scripts/demo.py` from the host (put the keys from `.env.docker` in
 your environment or pass `--env-file .env.docker`).
 
+## Complete endpoint reference
+
+All paths below are relative to the selected shop's base URL: `http://127.0.0.1:8001` (PL),
+`http://127.0.0.1:8002` (DE), or `http://127.0.0.1:8003` (RU). Each shop exposes the same 17 REST
+operations, documentation routes and MCP endpoint. The shop is selected by the server configuration, not a request.
+
+Business endpoints and `/mcp` require `Authorization: Bearer <API key>` for that shop.
+Health probes, Swagger UI and the OpenAPI document are public. Carts, quotes and orders belong to the
+authenticated customer; identifiers belonging to another customer return a not-found error.
+Optional `X-Request-ID` and `X-Correlation-ID` headers help trace requests.
+
+### Health and API documentation
+
+* `GET /health/live` — process liveness; returns `{"status":"ok"}` without querying the database.
+* `GET /health/ready` — checks database connectivity, migration revision and store configuration;
+  returns HTTP 503 when the instance is not ready.
+* `GET /docs` — interactive Swagger UI; use **Authorize** to enter a Bearer API key for business requests.
+* `GET /docs/oauth2-redirect` — Swagger UI's generated OAuth2 redirect helper; the shop itself uses API keys.
+* `GET /openapi.json` — machine-readable REST schemas, parameters and responses.
+
+### Catalog
+
+* `GET /store` — shop identity, country, currency, locale, quote TTL and cart limits; returns `StoreInfo`.
+* `GET /categories` — categories with active product counts; returns `{"items": [...]}`.
+* `GET /products` — browse or search active products; returns `items`, `total`, `limit` and `offset`.
+  Optional query parameters: `q` (name, SKU or canonical item code, up to 100 characters), `category`
+  (slug, up to 64 characters), `availability` (`in_stock` or `out_of_stock`), repeatable `origin`
+  (up to 30 ISO alpha-2 country codes), `sort` (`name`, `sku`, `price_asc`, `price_desc`; default `name`),
+  `limit` (1–100; default 20) and `offset` (0–100000; default 0).
+  Example: `/products?q=PAPER-A4&origin=PL&origin=CZ&sort=price_asc&limit=20&offset=0`.
+* `GET /products/{sku}` — one product, including packaging, gross price, stock and `country_of_origin`;
+  returns `ProductOut`.
+* `GET /shipping-methods` — shipping methods, gross prices and estimated delivery days;
+  returns `{"items": [...]}`.
+
+Prices ending in `_minor` are integers in the shop's currency; quantities count packs, not individual units
+inside a pack. `store_country` and product `country_of_origin` are independent fields.
+
+### Carts
+
+* `POST /carts` — create an empty cart; no request body; returns `CartOut` with HTTP 201.
+* `GET /carts/{cart_id}` — read the cart, lines, subtotal, origins, status and version; returns `CartOut`.
+* `PUT /carts/{cart_id}/items/{sku}` — add a product or replace its absolute pack quantity.
+  JSON body: `{"quantity": 2, "expected_version": 1}`; `expected_version` is optional.
+  Quantity must be an integer from 1 to the shop's `max_line_quantity`; use DELETE to remove a line.
+  Returns the updated `CartOut`.
+* `DELETE /carts/{cart_id}/items/{sku}` — remove one line; an absent line is a no-op.
+  Optional query parameter: `expected_version` (integer, at least 1). Returns the updated `CartOut`.
+* `DELETE /carts/{cart_id}/items` — clear all lines. Optional query parameter:
+  `expected_version` (integer, at least 1). Returns the updated `CartOut`.
+
+Cart IDs are UUIDs. Mutations increment the cart version; supplying a mismatched `expected_version`
+returns `CART_VERSION_CONFLICT` (409). Carts do not reserve stock.
+
+### Quotes and checkout
+
+* `POST /carts/{cart_id}/quotes` — create an immutable quote; returns `QuoteOut` with HTTP 201.
+  Required JSON field: `shipping_address`. Optional fields: `shipping_method_code` (1–32 lowercase
+  letters, digits, underscores or hyphens; defaults to the shop's first shipping method) and
+  `expected_cart_version` (integer, at least 1).
+* `GET /quotes/{quote_id}` — read a quote's line snapshots, shipping, totals, origins and expiry;
+  returns `QuoteOut`. The quote ID is a UUID.
+* `POST /checkout` — purchase the quoted cart using mock payment; returns `CheckoutOut` with
+  HTTP 200: `{"order": {...}, "idempotent_replay": false}`. Required JSON body:
+  `{"quote_id": "<UUID>", "idempotency_key": "my-key-0001"}`. The key must contain 8–128 characters
+  drawn from letters, digits, `.`, `_`, `:`, and `-`.
+
+`shipping_address` requires `recipient_name`, `line1`, `postal_code`, `city` and `country`
+(ISO alpha-2 destination code); `line2`, `phone` and `email` are optional. For example:
+
+```json
+{
+  "shipping_address": {
+    "recipient_name": "Jan Demo",
+    "line1": "Przykladowa 1",
+    "postal_code": "00-001",
+    "city": "Warszawa",
+    "country": "PL"
+  },
+  "shipping_method_code": "standard",
+  "expected_cart_version": 2
+}
+```
+
+Quotes expire after 300 seconds by default and do not buy or reserve stock. Checkout validates the quote,
+decrements stock and creates the order in one transaction. Repeating the same quote and idempotency key
+returns the original order with `idempotent_replay: true`; reusing the key for a different quote returns
+`IDEMPOTENCY_CONFLICT` (409). Prices, currency, customer identity and payment outcome are server-controlled.
+
+### Orders
+
+* `GET /orders` — list the authenticated customer's orders, newest first; returns `items`, `total`,
+  `limit` and `offset`. Optional query parameters: `limit` (1–100; default 20),
+  `offset` (0–100000; default 0).
+* `GET /orders/{order_id}` — read one order, including immutable product and shipping snapshots,
+  totals and mock payment status; returns `OrderOut`. The order ID is a UUID.
+
+### MCP endpoint and all tools
+
+`POST /mcp` accepts MCP JSON-RPC requests over Streamable HTTP, with stateless JSON responses.
+Use an MCP client to initialize the connection, discover tools with `tools/list`, and invoke them with
+`tools/call`. Every call requires the same shop Bearer key as REST. Tool results use the same service
+and response models as the corresponding REST operation.
+
+All 15 tools are listed below; arguments marked `?` are optional:
+
+* `get_store_info()` — `GET /store`.
+* `list_categories()` — `GET /categories`.
+* `search_products(q?, category?, availability?, origin_countries?, sort?, limit?, offset?)` —
+  `GET /products`; use an array of country codes in `origin_countries` instead of repeatable REST `origin` parameters.
+* `get_product(sku)` — `GET /products/{sku}`.
+* `list_shipping_methods()` — `GET /shipping-methods`.
+* `create_cart()` — `POST /carts`.
+* `get_cart(cart_id)` — `GET /carts/{cart_id}`.
+* `set_cart_item(cart_id, sku, quantity, expected_version?)` — `PUT /carts/{cart_id}/items/{sku}`.
+* `remove_cart_item(cart_id, sku, expected_version?)` — `DELETE /carts/{cart_id}/items/{sku}`.
+* `clear_cart(cart_id, expected_version?)` — `DELETE /carts/{cart_id}/items`.
+* `create_checkout_quote(cart_id, shipping_address, shipping_method_code?, expected_cart_version?)` —
+  `POST /carts/{cart_id}/quotes`.
+* `get_checkout_quote(quote_id)` — `GET /quotes/{quote_id}`.
+* `checkout(quote_id, idempotency_key)` — `POST /checkout`; creates an order and reduces stock.
+* `list_orders(limit?, offset?)` — `GET /orders`.
+* `get_order(order_id)` — `GET /orders/{order_id}`.
+
+Health and documentation routes have no MCP tools. See the MCP client example below and
+[`docs/integration.md`](docs/integration.md) for transport details and tool annotations.
+
+### Error responses
+
+REST failures return `{"error": {"code": "...", "message": "...", "request_id": "...",
+"correlation_id": "...", "details": {}}}`. Common statuses are 401 for missing or invalid keys,
+404 for missing or inaccessible objects, 422 for invalid input, 409 for cart conflicts or stale/expired quotes,
+402 for declined mock payment and 503 for database unavailability. Unknown request body fields are rejected.
+MCP tool failures use `isError: true` and include the same error payload in the result text;
+authentication failures at `/mcp` return HTTP 401. The complete error-code reference is in
+[`docs/integration.md`](docs/integration.md#errors).
+
 ## Request examples
 
 Keys are in `.env.local` as `DEMO_API_KEY_SHOP_RU_AGENT` etc. PowerShell:
