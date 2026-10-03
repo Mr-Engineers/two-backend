@@ -7,6 +7,8 @@ __pycache__/
 venv/
 env/
 .env
+.env.*
+!.env.example
 .idea/
 .vscode/
 *.egg-info/
@@ -15,3 +17,9 @@ build/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# local embedded Postgres + generated local credentials (never commit)
+.pgdata/
+.pgtest_probe/
+.run/
+*.log

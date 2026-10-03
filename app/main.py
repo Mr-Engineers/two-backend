@@ -1,53 +1,87 @@
+"""Application factory. One code base, three instances selected by SHOP_ID::
+
+    SHOP_ID=shop-pl DATABASE_URL=... uvicorn app.main:create_app --factory --port 8001
+"""
+
+from __future__ import annotations
+
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from datetime import datetime
+from typing import AsyncIterator, Callable
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from mcp.server.streamable_http_manager import StreamableHTTPASGIApp
+from starlette.routing import Route
 
-from app.api.routes import api_router
-from app.core.config import get_settings
+from app.api.errors import install_error_handlers
+from app.api.routers import ALL_ROUTERS
+from app.config import Settings, get_settings
+from app.db.session import Database
+from app.logging_setup import configure_logging
+from app.mcp_server import McpAuthApp, build_mcp_server, transport_security
+from app.request_context import RequestContextMiddleware
+from app.services.payment import PaymentProvider
+from app.services.shop import ShopService, _utcnow
 
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    # Place startup hooks here (e.g. warm Supabase client).
-    yield
-    # Place shutdown hooks here.
+def create_app(
+    settings: Settings | None = None,
+    *,
+    payment: PaymentProvider | None = None,
+    clock: Callable[[], datetime] = _utcnow,
+) -> FastAPI:
+    # Settings() raises if SHOP_ID / DATABASE_URL are missing: the process refuses to start
+    # instead of pretending to be a working shop.
+    settings = settings or get_settings()
+    configure_logging(settings.log_level)
+    shop = settings.shop
 
+    db = Database(
+        settings.database_url.get_secret_value(),
+        shop.schema,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_timeout=settings.db_pool_timeout,
+        connect_timeout=settings.db_connect_timeout,
+    )
+    service = ShopService(settings, db, payment=payment, clock=clock)
+    mcp = build_mcp_server(service)
+    # Builds the Streamable HTTP session manager (stateless: every request is self-contained).
+    mcp.streamable_http_app(
+        json_response=True,
+        stateless_http=True,
+        transport_security=transport_security(settings.extra_allowed_hosts),
+    )
 
-def create_app() -> FastAPI:
-    settings = get_settings()
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        async with mcp.session_manager.run():  # MCP SDK lifecycle must run inside the FastAPI lifespan
+            try:
+                yield
+            finally:
+                db.dispose()
 
-    application = FastAPI(
-        title=settings.app_name,
+    app = FastAPI(
+        title=f"{shop.name} - office supplies shop ({shop.shop_id})",
         description=(
-            "Hackathon backend API. Supabase-ready FastAPI service with "
-            "versioned routes and OpenAPI documentation."
+            f"Demo shop backend. Store country **{shop.country}**, currency **{shop.currency}**, "
+            "catalog language "
+            f"**{shop.locale}**. Every product carries `country_of_origin` (ISO 3166-1 alpha-2) which is "
+            "independent from the store country. Authenticate with `Authorization: Bearer <demo API key>`. "
+            "The same operations are available over MCP at `/mcp` (Streamable HTTP)."
         ),
-        version="0.1.0",
+        version="1.0.0",
         lifespan=lifespan,
         docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
-        openapi_tags=[
-            {
-                "name": "Health",
-                "description": "Liveness and readiness probes.",
-            },
-        ],
+        redoc_url=None,
     )
+    app.state.service = service
+    app.state.settings = settings
+    install_error_handlers(app)
+    for router in ALL_ROUTERS:
+        app.include_router(router)
 
-    application.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    application.include_router(api_router, prefix=settings.api_prefix)
-
-    return application
-
-
-app = create_app()
+    mcp_endpoint = McpAuthApp(StreamableHTTPASGIApp(mcp.session_manager), service)
+    app.router.routes.append(Route("/mcp", endpoint=mcp_endpoint))
+    app.add_middleware(RequestContextMiddleware)
+    return app

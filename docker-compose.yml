@@ -1,0 +1,71 @@
+# Local stack: PostgreSQL + one-shot bootstrap + three shops from ONE image.
+#
+#   python -m app.cli gen-credentials --out .env.docker --db-host db --db-name shops --migration-url "postgresql://postgres:<pw>@db:5432/shops"
+#   (add POSTGRES_PASSWORD=<pw> to .env.docker)
+#   docker compose --env-file .env.docker up --build
+#
+# Shops are published on 127.0.0.1 only: 8001 (PL), 8002 (DE), 8003 (RU). For Supabase, drop the `db` service,
+# point MIGRATION_DATABASE_URL / DATABASE_URL_* at Supabase (sslmode=verify-full) and see README.
+
+x-shop: &shop
+  build: .
+  image: office-shops:local
+  restart: unless-stopped
+  depends_on:
+    bootstrap:
+      condition: service_completed_successfully
+  read_only: true
+  tmpfs: [/tmp]
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.docker}
+      POSTGRES_DB: shops
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d shops"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Creates schemas + runtime roles, applies migrations, seeds. Only this service sees the migration account.
+  bootstrap:
+    build: .
+    image: office-shops:local
+    command: ["python", "-m", "app.cli", "bootstrap"]
+    env_file: .env.docker
+    depends_on:
+      db:
+        condition: service_healthy
+
+  shop-pl:
+    <<: *shop
+    environment:
+      SHOP_ID: shop-pl
+      APP_ENV: development
+      DATABASE_URL: ${DATABASE_URL_SHOP_PL:?missing}
+    ports: ["127.0.0.1:8001:8000"]
+
+  shop-de:
+    <<: *shop
+    environment:
+      SHOP_ID: shop-de
+      APP_ENV: development
+      DATABASE_URL: ${DATABASE_URL_SHOP_DE:?missing}
+    ports: ["127.0.0.1:8002:8000"]
+
+  shop-ru:
+    <<: *shop
+    environment:
+      SHOP_ID: shop-ru
+      APP_ENV: development
+      DATABASE_URL: ${DATABASE_URL_SHOP_RU:?missing}
+    ports: ["127.0.0.1:8003:8000"]
+
+volumes:
+  pgdata:

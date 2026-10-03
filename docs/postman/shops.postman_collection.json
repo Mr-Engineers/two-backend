@@ -1,0 +1,706 @@
+{
+  "info": {
+    "name": "Office Shops Backend",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "All REST endpoints, MCP examples and API documentation. Select a shop environment and enter its api_key. Run numbered purchase requests in order. Cart deletion requests require an open cart."
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{api_key}}",
+        "type": "string"
+      }
+    ]
+  },
+  "item": [
+    {
+      "name": "REST: catalog and purchase flow",
+      "item": [
+        {
+          "name": "Health: live",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health/live",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "health",
+                "live"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Health: ready",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health/ready",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "health",
+                "ready"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Store",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/store",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "store"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Categories",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/categories",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "categories"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Products: search and filters",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/products?sort=name&limit=20&offset=0",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "PAPER",
+                  "disabled": true
+                },
+                {
+                  "key": "category",
+                  "value": "paper",
+                  "disabled": true
+                },
+                {
+                  "key": "availability",
+                  "value": "in_stock",
+                  "disabled": true
+                },
+                {
+                  "key": "origin",
+                  "value": "PL",
+                  "disabled": true
+                },
+                {
+                  "key": "sort",
+                  "value": "name"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                },
+                {
+                  "key": "offset",
+                  "value": "0"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Product by SKU",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/products/{{sku}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "products",
+                "{{sku}}"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Shipping methods",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/shipping-methods",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "shipping-methods"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "1. Create cart",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/carts",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "carts"
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Request succeeded', () => pm.expect(pm.response.code).to.be.within(200, 299));",
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                  "const data = pm.response.json();",
+                  "pm.environment.set('cart_id', data.id);",
+                  "pm.environment.set('cart_version', data.version);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2. Set item quantity",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/carts/{{cart_id}}/items/{{sku}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "carts",
+                "{{cart_id}}",
+                "items",
+                "{{sku}}"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"quantity\": 1\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Request succeeded', () => pm.expect(pm.response.code).to.be.within(200, 299));",
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                  "const data = pm.response.json();",
+                  "pm.environment.set('cart_id', data.id);",
+                  "pm.environment.set('cart_version', data.version);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3. Get cart",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/carts/{{cart_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "carts",
+                "{{cart_id}}"
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Request succeeded', () => pm.expect(pm.response.code).to.be.within(200, 299));",
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                  "const data = pm.response.json();",
+                  "pm.environment.set('cart_id', data.id);",
+                  "pm.environment.set('cart_version', data.version);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4. Create quote",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/carts/{{cart_id}}/quotes",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "carts",
+                "{{cart_id}}",
+                "quotes"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"shipping_method_code\": \"standard\",\n  \"shipping_address\": {\n    \"recipient_name\": \"Demo Customer\",\n    \"line1\": \"Example Street 1\",\n    \"postal_code\": \"00-001\",\n    \"city\": \"Demo City\",\n    \"country\": \"{{country}}\",\n    \"email\": \"demo@example.com\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Request succeeded', () => pm.expect(pm.response.code).to.be.within(200, 299));",
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                  "const data = pm.response.json();",
+                  "pm.environment.set('quote_id', data.quote_id);",
+                  "pm.environment.set('idempotency_key', pm.variables.replaceIn('{{$guid}}'));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5. Get quote",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/quotes/{{quote_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "quotes",
+                "{{quote_id}}"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "6. Checkout (mock payment, reduces stock)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/checkout",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "checkout"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"quote_id\": \"{{quote_id}}\",\n  \"idempotency_key\": \"{{idempotency_key}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Request succeeded', () => pm.expect(pm.response.code).to.be.within(200, 299));",
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                  "const data = pm.response.json();",
+                  "pm.environment.set('order_id', data.order.order_id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "7. Orders",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/orders?limit=20&offset=0",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "orders"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                },
+                {
+                  "key": "offset",
+                  "value": "0"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "8. Order details",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/orders/{{order_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "orders",
+                "{{order_id}}"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Cart deletion: run separately before checkout",
+      "item": [
+        {
+          "name": "Remove item (open cart)",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/carts/{{cart_id}}/items/{{sku}}?",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "carts",
+                "{{cart_id}}",
+                "items",
+                "{{sku}}"
+              ],
+              "query": [
+                {
+                  "key": "expected_version",
+                  "value": "{{cart_version}}",
+                  "disabled": true
+                }
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Request succeeded', () => pm.expect(pm.response.code).to.be.within(200, 299));",
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                  "const data = pm.response.json();",
+                  "pm.environment.set('cart_id', data.id);",
+                  "pm.environment.set('cart_version', data.version);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Clear cart (open cart)",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/carts/{{cart_id}}/items?",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "carts",
+                "{{cart_id}}",
+                "items"
+              ],
+              "query": [
+                {
+                  "key": "expected_version",
+                  "value": "{{cart_version}}",
+                  "disabled": true
+                }
+              ]
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Request succeeded', () => pm.expect(pm.response.code).to.be.within(200, 299));",
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                  "const data = pm.response.json();",
+                  "pm.environment.set('cart_id', data.id);",
+                  "pm.environment.set('cart_version', data.version);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "MCP",
+      "item": [
+        {
+          "name": "MCP initialize",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/mcp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "mcp"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2025-03-26\",\n    \"capabilities\": {},\n    \"clientInfo\": {\n      \"name\": \"Postman\",\n      \"version\": \"1.0\"\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "MCP tools list",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/mcp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "mcp"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/list\",\n  \"params\": {}\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "MCP get store",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/mcp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "mcp"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_store_info\",\n    \"arguments\": {}\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Documentation",
+      "item": [
+        {
+          "name": "Swagger UI",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/docs",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "docs"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "OpenAPI JSON",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/openapi.json",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "openapi.json"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}
