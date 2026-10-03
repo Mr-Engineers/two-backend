@@ -71,6 +71,26 @@ uprawnieniami. `SHOP_ID` ustala sklep przy uruchomieniu procesu.
    dostaje tylko własny adres połączenia. Nie zmieniaj ręcznie tych adresów
    na połączenia do innych projektów.
 
+## Marketplace w tej samej bazie
+
+Marketplace używa tego samego projektu i tej samej bazy co sklepy, ale własnego schematu
+`marketplace` (tabele `merchants`, `offers`, `orders`, `idempotency_records`) i własnego
+użytkownika `marketplace_rt`. Użytkownicy sklepów nie mają do niego dostępu i odwrotnie.
+`gen-credentials` oraz `bootstrap` obsługują go razem ze sklepami, więc jeśli bazę
+utworzyłeś wcześniej, wykonaj ponownie (hasła i klucze zostaną zachowane):
+
+```powershell
+.\.venv\Scripts\python.exe -m app.cli --env-file .env gen-credentials
+.\.venv\Scripts\python.exe -m app.cli --env-file .env bootstrap
+.\.venv\Scripts\python.exe scripts/run_marketplace.py --env-file .env
+```
+
+`gen-credentials` dopisuje `MARKETPLACE_DATABASE_URL`, `MARKETPLACE_API_TOKEN` i
+`MARKETPLACE_ADMIN_TOKEN`. Marketplace działa na `http://127.0.0.1:8010` (`/search`,
+`/orders`, `/offers/{id}`, `/merchants/{id}`, `/openapi.json`). Scenariusz demo ładujesz przez
+`POST /admin/scenarios/{id}/load` albo `python -m app.cli --env-file .env load-scenario foreign_cheapest`.
+W Data API nie dodawaj schematu `marketplace` do **Exposed schemas**.
+
 Domyślne narzędzia nadal obsługują `.env.local`; powyższe komendy jawnie
 wybierają `.env`. Dla produkcji ustaw `APP_ENV=production`, zmniejsz pule
 (`DB_POOL_SIZE=2`, `DB_MAX_OVERFLOW=0`, jeśli limit połączeń jest mały)
