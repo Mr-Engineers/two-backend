@@ -6,8 +6,11 @@ offers of several merchants; the proxy-server calls it on behalf of the purchasi
 
 from __future__ import annotations
 
-MARKETPLACE_SCHEMA = "marketplace"
+# The marketplace lives in the shared ``shops`` schema (one offers table per merchant + the ``shops.offers`` view);
+# merchant profiles are ``warehouse.suppliers``. Orders and idempotency records are the only tables created here.
+MARKETPLACE_SCHEMA = "shops"
+SUPPLIERS_SCHEMA = "warehouse"
 MARKETPLACE_ROLE = "marketplace_rt"
 MARKETPLACE_DEV_PORT = 8010
 # Schema revision this code expects (/health/ready checks it; a test keeps it equal to the Alembic head).
-MARKETPLACE_HEAD_REVISION = "m0001"
+MARKETPLACE_HEAD_REVISION = "m0003"

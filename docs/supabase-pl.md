@@ -73,9 +73,9 @@ uprawnieniami. `SHOP_ID` ustala sklep przy uruchomieniu procesu.
 
 ## Marketplace w tej samej bazie
 
-Marketplace używa tego samego projektu i tej samej bazy co sklepy, ale własnego schematu
-`marketplace` (tabele `merchants`, `offers`, `orders`, `idempotency_records`) i własnego
-użytkownika `marketplace_rt`. Użytkownicy sklepów nie mają do niego dostępu i odwrotnie.
+Marketplace używa tego samego projektu i tej samej bazy co sklepy, ale schematu `shops`
+(tabela ofert na każdego sprzedawcę + widok `shops.offers` + `orders`, `idempotency_records`),
+profili sprzedawców w `warehouse.suppliers` i własnego użytkownika `marketplace_rt`. Użytkownicy sklepów nie mają do niego dostępu i odwrotnie.
 `gen-credentials` oraz `bootstrap` obsługują go razem ze sklepami, więc jeśli bazę
 utworzyłeś wcześniej, wykonaj ponownie (hasła i klucze zostaną zachowane):
 
@@ -89,7 +89,7 @@ utworzyłeś wcześniej, wykonaj ponownie (hasła i klucze zostaną zachowane):
 `MARKETPLACE_ADMIN_TOKEN`. Marketplace działa na `http://127.0.0.1:8010` (`/search`,
 `/orders`, `/offers/{id}`, `/merchants/{id}`, `/openapi.json`). Scenariusz demo ładujesz przez
 `POST /admin/scenarios/{id}/load` albo `python -m app.cli --env-file .env load-scenario foreign_cheapest`.
-W Data API nie dodawaj schematu `marketplace` do **Exposed schemas**.
+Schematy `shops` i `warehouse` są współdzielone z innymi zespołami (`service_role`), więc nic im nie odbieramy.
 
 Domyślne narzędzia nadal obsługują `.env.local`; powyższe komendy jawnie
 wybierają `.env`. Dla produkcji ustaw `APP_ENV=production`, zmniejsz pule

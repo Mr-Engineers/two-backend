@@ -101,6 +101,17 @@ def db_env(admin_url):
     import psycopg
 
     url = admin_url.replace("postgresql://", "postgresql://", 1)
+    # The marketplace tests DROP the shared ``shops`` schema: never run them against the real project database.
+    real_url = os.environ.get("MIGRATION_DATABASE_URL")
+    if not real_url:
+        try:
+            from dotenv import dotenv_values
+
+            real_url = dotenv_values(".env").get("MIGRATION_DATABASE_URL")
+        except ImportError:  # pragma: no cover
+            real_url = None
+    if real_url and real_url.strip() == url.strip():
+        pytest.exit("Refusing to run the tests: TEST_DATABASE_ADMIN_URL equals MIGRATION_DATABASE_URL (real database).")
     with psycopg.connect(url, autocommit=True) as conn:
         for schema in (*ALL_SCHEMAS, MARKETPLACE_SCHEMA):
             conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

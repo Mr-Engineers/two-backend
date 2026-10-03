@@ -25,7 +25,8 @@ from app.marketplace.main import create_app
 from app.marketplace.models import MarketplaceBase
 from app.marketplace.scenarios import SCENARIO_IDS, build_scenario
 from app.marketplace.schemas import Money, amount_to_minor, minor_to_amount
-from app.marketplace.seed import load_scenario, seed_marketplace
+from app.marketplace.models import MARKETPLACE_TABLES, MERCHANT_TABLES
+from app.marketplace.seed import clear_marketplace, load_scenario, seed_marketplace
 from app.marketplace.service import CallerContext
 
 API_TOKEN = "test-api-token-0123456789"
@@ -147,7 +148,17 @@ def test_scenario_counts_match_the_contract():
         "fresh_domain_discount": (4, 6),
         "indirect_injection": (4, 6),
         "malicious_code": (4, 6),
+        "extended_catalog": (5, 65),  # extra demo data, not in the contract
     }
+
+
+def test_extended_catalog_keeps_contract_skus_untouched():
+    base = build_scenario("happy_path", date(2026, 10, 3))
+    ext = build_scenario("extended_catalog", date(2026, 10, 3))
+    contract = lambda s: {o.id: o for o in s.offers if o.sku in {PAPER, TONER}}
+    assert contract(ext) == contract(base)
+    assert len({o.id for o in ext.offers}) == len(ext.offers)
+    assert {o.merchant_id for o in ext.offers} <= {m.id for m in ext.merchants}
 
 
 def test_settings_validation():
@@ -478,9 +489,7 @@ def test_seed_is_idempotent_and_never_replaces_a_loaded_scenario(mp):
     assert result["scenario_id"] is None
     assert mp.get("/merchants/mer_cheapdeals").status_code == 200
     with mp.admin_db.begin() as s:
-        s.execute(text(f'SET LOCAL search_path TO "{MARKETPLACE_SCHEMA}"'))
-        s.execute(text("DELETE FROM offers"))
-        s.execute(text("DELETE FROM merchants"))
+        clear_marketplace(s)
     assert seed_marketplace(mp.admin_db, date.today())["offers_loaded"] == 5
     assert load_scenario(mp.admin_db, "happy_path", date.today())["merchants_loaded"] == 3
 
@@ -545,9 +554,7 @@ def test_readiness_reports_ready(mp):
 
 def test_readiness_fails_without_loaded_scenario(mp):
     with mp.admin_db.begin() as s:
-        s.execute(text(f'SET LOCAL search_path TO "{MARKETPLACE_SCHEMA}"'))
-        s.execute(text("DELETE FROM offers"))
-        s.execute(text("DELETE FROM merchants"))
+        clear_marketplace(s)
     error_of(mp.client.get("/health/ready"), 503, "not_ready")
     assert mp.client.get("/health/live").status_code == 200
 
@@ -578,8 +585,11 @@ def test_unreachable_database_never_fakes_success():
 def test_runtime_role_has_least_privileges(mp):
     engine = create_engine(mp.runtime_url.replace("postgresql://", "postgresql+psycopg://", 1))
     forbidden = [
-        "UPDATE offers SET unit_price_minor = 1",
-        "UPDATE merchants SET verified = true",
+        "UPDATE biuromax SET unit_price = 1",
+        "UPDATE warehouse.suppliers SET created_at = now()",
+        "UPDATE offers SET available_qty = 1",  # the UNION view is read-only (OperationalError: not updatable)
+        "DELETE FROM warehouse.products",
+        "SELECT * FROM warehouse.purchase_orders",
         "DELETE FROM orders",
         "UPDATE orders SET quantity = 1",
         "DELETE FROM idempotency_records",
@@ -591,10 +601,10 @@ def test_runtime_role_has_least_privileges(mp):
             conn.execute(text(f'SET search_path TO "{MARKETPLACE_SCHEMA}"'))
             conn.commit()
             for statement in forbidden:
-                with pytest.raises(sa_exc.ProgrammingError):
+                with pytest.raises((sa_exc.ProgrammingError, sa_exc.OperationalError)):
                     conn.execute(text(statement))
                 conn.rollback()
-            conn.execute(text("UPDATE offers SET available_qty = available_qty"))  # the one allowed column
+            conn.execute(text("UPDATE biuromax SET available_qty = available_qty"))  # the one allowed column
             conn.rollback()
             for shop_schema in ("shop_pl", "shop_de", "shop_ru"):
                 with pytest.raises(sa_exc.ProgrammingError):
@@ -621,11 +631,28 @@ def test_models_match_the_alembic_migration(admin_url, db_env):
     engine = create_engine(admin_url.replace("postgresql://", "postgresql+psycopg://", 1))
     with engine.connect() as conn:
         conn.execute(text(f'SET search_path TO "{MARKETPLACE_SCHEMA}"'))
-        ctx = MigrationContext.configure(conn, opts={"compare_type": True, "version_table_schema": MARKETPLACE_SCHEMA})
-        diff = [d for d in compare_metadata(ctx, MarketplaceBase.metadata)
-                if not (d[0] == "remove_table" and d[1].name == "alembic_version")]
+        # Only the tables this service owns are compared; the merchant tables, the offers view and
+        # warehouse.suppliers belong to the shops/warehouse layout.
+        ctx = MigrationContext.configure(
+            conn,
+            opts={
+                "compare_type": True,
+                "version_table_schema": MARKETPLACE_SCHEMA,
+                "include_object": lambda obj, name, type_, reflected, compare_to: (
+                    name in MARKETPLACE_TABLES if type_ == "table" else True
+                ),
+            },
+        )
+        diff = compare_metadata(ctx, MarketplaceBase.metadata)
+        view_tables = conn.execute(
+            text("SELECT count(*) FROM information_schema.tables WHERE table_schema = :s AND table_name = ANY(:t)"),
+            {"s": MARKETPLACE_SCHEMA, "t": list(MERCHANT_TABLES.values())},
+        ).scalar()
+        view_sql = conn.execute(text(f"SELECT pg_get_viewdef('\"{MARKETPLACE_SCHEMA}\".offers'::regclass)")).scalar()
     engine.dispose()
     assert diff == []
+    assert view_tables == len(MERCHANT_TABLES)
+    assert all(table in view_sql for table in MERCHANT_TABLES.values())
 
 
 def test_revision_constant_matches_alembic_head():
@@ -657,6 +684,330 @@ def test_launchers_do_not_leak_secrets_between_processes(monkeypatch):
 def test_setup_sql_covers_the_marketplace():
     sql = dbadmin.render_setup_sql()
     assert "marketplace_rt" in sql and "<PASSWORD_FOR_MARKETPLACE_RT>" in sql
-    assert 'GRANT UPDATE (available_qty) ON "marketplace"."offers"' in sql
+    assert 'GRANT UPDATE (available_qty) ON "shops"."biuromax"' in sql
+    assert "service_role" not in "\n".join(dbadmin.marketplace_grants_statements())  # shared schema: no revokes
     for statement in dbadmin.marketplace_setup_statements("pw"):
         assert not any(flag in statement for flag in ("SUPERUSER", "REPLICATION", "BYPASSRLS")) or "rolsuper" in statement
+
+
+# ------------------------------------------------------------------------------------------ Supabase REST mode
+# SUPABASE_URL + SUPABASE_KEY: the data layer talks PostgREST. Idempotent orders and the scenario loader run as SQL
+# functions (migration m0003), tested here on the real PostgreSQL; the HTTP side is tested against a mock transport.
+import json  # noqa: E402
+
+import httpx  # noqa: E402
+
+from app.marketplace.config import normalize_supabase_url  # noqa: E402
+from app.marketplace.rest_service import scenario_payload  # noqa: E402
+
+FINGERPRINT = "a" * 64
+
+
+def _create_order_sql(mp, key, offer="off_bm_pap", qty=38, minor=11800, currency="PLN", decrement=False, fp=FINGERPRINT):
+    return mp.sql(
+        "SELECT shops.create_order(:k, :f, :o, :q, :m, :c, :d, 'req-1', 'agent-1')",
+        k=key, f=fp, o=offer, q=qty, m=minor, c=currency, d=decrement,
+    )[0][0]
+
+
+def test_sql_create_order_is_idempotent(mp):
+    first = _create_order_sql(mp, "key-sql-00001")
+    assert first["status"] == "confirmed" and first["id"].startswith("ord_")
+    assert first["total_minor"] == 11800 * 38 and first["on_behalf_of"] == "agent-1" and first["request_id"] == "req-1"
+    assert _create_order_sql(mp, "key-sql-00001")["id"] == first["id"]
+    assert mp.sql("SELECT count(*) FROM orders")[0][0] == 1
+    with pytest.raises(sa_exc.DBAPIError, match="idempotency_conflict"):
+        _create_order_sql(mp, "key-sql-00001", qty=39, fp="b" * 64)
+    assert mp.sql("SELECT count(*) FROM orders")[0][0] == 1
+
+
+@pytest.mark.parametrize(
+    "kwargs, code",
+    [
+        ({"offer": "off_nope"}, "offer_not_found"),
+        ({"minor": 11700}, "price_changed"),
+        ({"currency": "EUR"}, "price_changed"),
+        ({"qty": 501}, "insufficient_quantity"),
+    ],
+)
+def test_sql_create_order_errors(mp, kwargs, code):
+    with pytest.raises(sa_exc.DBAPIError, match=code):
+        _create_order_sql(mp, "key-sql-err-01", **kwargs)
+    assert mp.sql("SELECT count(*) FROM orders")[0][0] == 0
+    assert mp.sql("SELECT count(*) FROM idempotency_records")[0][0] == 0
+
+
+def test_sql_create_order_decrements_stock_only_when_asked(mp):
+    _create_order_sql(mp, "key-sql-stock-1", qty=100)
+    assert mp.sql("SELECT available_qty FROM offers WHERE offer_id = 'off_bm_pap'")[0][0] == 500
+    _create_order_sql(mp, "key-sql-stock-2", qty=100, decrement=True)
+    assert mp.sql("SELECT available_qty FROM offers WHERE offer_id = 'off_bm_pap'")[0][0] == 400
+    with pytest.raises(sa_exc.DBAPIError, match="insufficient_quantity"):
+        _create_order_sql(mp, "key-sql-stock-3", qty=401, decrement=True)
+
+
+def test_sql_functions_are_not_callable_by_the_runtime_role(mp):
+    engine = create_engine(mp.runtime_url.replace("postgresql://", "postgresql+psycopg://", 1))
+    try:
+        with engine.connect() as conn:
+            with pytest.raises(sa_exc.ProgrammingError, match="permission denied"):
+                conn.execute(text("SELECT shops.create_order('key-rt-00001', :f, 'off_bm_pap', 1, 11800, 'PLN')"), {"f": FINGERPRINT})
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("scenario_id", SCENARIO_IDS)
+def test_sql_load_scenario_matches_the_python_loader(mp, scenario_id):
+    merchants, offers = scenario_payload(scenario_id, date.today())
+    result = mp.sql("SELECT shops.load_scenario(:s, CAST(:m AS jsonb), CAST(:o AS jsonb))",
+                    s=scenario_id, m=json.dumps(merchants), o=json.dumps(offers))[0][0]
+    expected = build_scenario(scenario_id, date.today())
+    assert result == {"scenario_id": scenario_id, "merchants_loaded": len(expected.merchants), "offers_loaded": len(expected.offers)}
+    assert mp.sql("SELECT count(*) FROM offers")[0][0] == len(expected.offers)
+    assert mp.sql("SELECT count(*) FROM warehouse.suppliers WHERE merchant_id = ANY(:ids)", ids=list(MERCHANT_IDS))[0][0] == len(expected.merchants)
+    # the API sees exactly what the SQL loader would have produced
+    assert mp.get("/search", params={"sku": PAPER, "limit": 50}).json()["total"] == sum(o.sku == PAPER for o in expected.offers)
+
+
+MERCHANT_IDS = (
+    "mer_biuromax", "mer_ofistorg", "mer_cheapdeals", "mer_officehub", "mer_printworks",
+    "mer_papiernik", "mer_promocje", "mer_papierhurt", "mer_tonerfix",
+)
+
+
+def test_supabase_settings():
+    kw = {"_env_file": None, "app_env": "test"}
+    s = MarketplaceSettings(supabase_url="https://abc.supabase.co/", supabase_key="sb_secret_x", **kw)
+    assert s.backend == "supabase" and s.supabase_url == "https://abc.supabase.co" and s.marketplace_database_url is None
+    assert normalize_supabase_url("https://abc.supabase.co/rest/v1") == "https://abc.supabase.co"
+    assert MarketplaceSettings(marketplace_database_url="postgresql://u:p@h/db", **kw).backend == "postgres"
+    both = MarketplaceSettings(
+        supabase_url="https://abc.supabase.co", supabase_key="k", marketplace_database_url="postgresql://u:p@h/db", **kw
+    )
+    assert both.backend == "supabase"  # REST wins
+    for bad in (
+        {"supabase_url": "https://abc.supabase.co"},  # key missing
+        {"supabase_key": "k"},  # url missing
+        {"supabase_url": "ftp://abc", "supabase_key": "k"},
+        {"supabase_url": "https://abc.supabase.co/some/path", "supabase_key": "k"},
+        {},  # nothing configured
+    ):
+        with pytest.raises(ValidationError):
+            MarketplaceSettings(**bad, **kw)
+    with pytest.raises(ValidationError):  # production: http and no token
+        MarketplaceSettings(supabase_url="http://abc.supabase.co", supabase_key="k", marketplace_api_token="t", _env_file=None, app_env="production")
+    with pytest.raises(ValidationError):
+        MarketplaceSettings(supabase_url="https://abc.supabase.co", supabase_key="k", _env_file=None, app_env="production")
+    MarketplaceSettings(supabase_url="https://abc.supabase.co", supabase_key="k", marketplace_api_token="t", _env_file=None, app_env="production")
+
+
+class FakeSupabase:
+    """httpx transport standing in for https://<ref>.supabase.co: records requests, replies from a table of handlers."""
+
+    def __init__(self, handler):
+        self.handler = handler
+        self.requests: list[httpx.Request] = []
+        self.transport = httpx.MockTransport(self._respond)
+
+    def _respond(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return self.handler(request)
+
+
+OFFER_ROW = {
+    "offer_id": "off_bm_pap", "merchant_id": "mer_biuromax", "sku": PAPER, "product_name": "Papier A4 80 g/m², karton 5 ryz",
+    "unit_price": 118.0, "currency": "PLN", "available_qty": 500, "ships_from": "PL", "delivery_days": 2,
+    "description": "Papier biurowy klasy C.", "scenario_id": None, "active": True,
+}
+MERCHANT_ROW = {
+    "merchant_id": "mer_biuromax", "name": "BiuroMax", "domain": "biuromax.pl", "country": "PL",
+    "domain_registered_at": "2014-05-12", "verified": True, "reputation_score": 0.95, "reviews_count": 1284,
+    "offers_table": "biuromax", "scenario_id": None,
+}
+ORDER_ROW = {
+    "id": "ord_0123456789ab", "status": "confirmed", "offer_id": "off_bm_pap", "merchant_id": "mer_biuromax", "sku": PAPER,
+    "quantity": 38, "unit_price_minor": 11800, "currency": "PLN", "total_minor": 448400,
+    "created_at": "2026-10-03T14:07:05.123+00:00", "request_id": "r1", "on_behalf_of": "agent-1",
+}
+
+
+def _json(data, status=200, **headers):
+    return httpx.Response(status, json=data, headers=headers)
+
+
+def _supabase_client(handler, key="sb_secret_test", **settings):
+    fake = FakeSupabase(handler)
+    cfg = MarketplaceSettings(
+        supabase_url="https://abc.supabase.co", supabase_key=key, marketplace_api_token=API_TOKEN,
+        marketplace_admin_token=ADMIN_TOKEN, app_env="test", _env_file=None, **settings,
+    )
+    client = TestClient(create_app(cfg, transport=fake.transport), raise_server_exceptions=False)
+    return client, fake
+
+
+def _auth():
+    return {"Authorization": f"Bearer {API_TOKEN}"}
+
+
+def test_rest_search_queries_both_schemas_and_matches_the_contract_shape():
+    def handler(request):
+        if request.url.path == "/rest/v1/offers":
+            return _json([OFFER_ROW], **{"Content-Range": "0-0/7"})
+        if request.url.path == "/rest/v1/suppliers":
+            return _json([MERCHANT_ROW])
+        return _json({"code": "PGRST205", "message": "nope"}, 404)
+
+    client, fake = _supabase_client(handler)
+    with client:
+        r = client.get("/search", params={"sku": PAPER, "limit": 5}, headers=_auth())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 7
+    assert body["offers"][0] == {
+        "offer_id": "off_bm_pap", "merchant": {"id": "mer_biuromax", "name": "BiuroMax", "domain": "biuromax.pl"},
+        "product": {"sku": PAPER, "name": "Papier A4 80 g/m², karton 5 ryz"},
+        "unit_price": {"amount": "118.00", "currency": "PLN"}, "available_qty": 500, "ships_from": "PL",
+        "delivery_days": 2, "description": "Papier biurowy klasy C.",
+    }
+    offers_req, suppliers_req = fake.requests
+    params = dict(offers_req.url.params)
+    assert params["sku"] == f"eq.{PAPER}" and params["active"] == "eq.true" and params["limit"] == "5"
+    assert params["order"].startswith("unit_price.asc")
+    assert offers_req.headers["accept-profile"] == "shops" and suppliers_req.headers["accept-profile"] == "warehouse"
+    assert suppliers_req.url.params["merchant_id"] == "in.(mer_biuromax)"
+    assert "count=exact" in offers_req.headers["prefer"]
+
+
+def test_rest_search_by_name_escapes_wildcards():
+    client, fake = _supabase_client(lambda req: _json([], **{"Content-Range": "*/0"}))
+    with client:
+        r = client.get("/search", params={"q": "50%_a"}, headers=_auth())
+    assert r.status_code == 200 and r.json() == {"offers": [], "total": 0}
+    assert dict(fake.requests[0].url.params)["product_name"] == r"ilike.%50\%\_a%"
+
+
+def test_rest_merchant_offer_and_not_found():
+    def handler(request):
+        if request.url.path == "/rest/v1/suppliers":
+            ids = request.url.params["merchant_id"]
+            return _json([MERCHANT_ROW] if "mer_biuromax" in ids else [])
+        return _json([OFFER_ROW] if request.url.params["offer_id"] == "eq.off_bm_pap" else [])
+
+    client, _ = _supabase_client(handler)
+    with client:
+        m = client.get("/merchants/mer_biuromax", headers=_auth())
+        assert m.status_code == 200 and m.json()["reputation"] == {"score": 0.95, "reviews_count": 1284}
+        assert m.json()["domain_registered_at"] == "2014-05-12" and m.json()["country"] == "PL"
+        error_of(client.get("/merchants/mer_x", headers=_auth()), 404, "merchant_not_found")
+        assert client.get("/offers/off_bm_pap", headers=_auth()).json()["offer_id"] == "off_bm_pap"
+        error_of(client.get("/offers/off_x", headers=_auth()), 404, "offer_not_found")
+
+
+def test_rest_new_merchant_has_null_reputation():
+    row = {**MERCHANT_ROW, "reputation_score": None, "reviews_count": 0}
+    client, _ = _supabase_client(lambda req: _json([row]))
+    with client:
+        assert client.get("/merchants/mer_biuromax", headers=_auth()).json()["reputation"] is None
+
+
+def test_rest_create_order_calls_the_function_and_maps_errors():
+    seen = {}
+
+    def handler(request):
+        seen["request"] = request
+        key = json.loads(request.content)["p_idempotency_key"]
+        if key == "key-err-00001":
+            return _json({"code": "P0001", "message": "price_changed", "details": None, "hint": None}, 400)
+        if key == "key-err-00002":
+            return _json({"code": "P0001", "message": "insufficient_quantity", "details": None, "hint": None}, 400)
+        if key == "key-err-00003":
+            return _json({"code": "P0001", "message": "idempotency_conflict", "details": None, "hint": None}, 400)
+        if key == "key-err-00004":
+            return _json({"code": "P0001", "message": "offer_not_found", "details": None, "hint": None}, 400)
+        return _json(ORDER_ROW)
+
+    client, _ = _supabase_client(handler, marketplace_decrement_stock=True)
+    body = {"offer_id": "off_bm_pap", "quantity": 38, "expected_unit_price": {"amount": "118.00", "currency": "PLN"}}
+    with client:
+        ok = client.post("/orders", json=body, headers={**_auth(), "Idempotency-Key": "key-ok-000001", "X-On-Behalf-Of": "agent-1", "X-Request-Id": "r1"})
+        assert ok.status_code == 201, ok.text
+        assert ok.json() == {
+            "order_id": "ord_0123456789ab", "status": "confirmed", "offer_id": "off_bm_pap", "merchant_id": "mer_biuromax",
+            "sku": PAPER, "quantity": 38, "unit_price": {"amount": "118.00", "currency": "PLN"},
+            "total": {"amount": "4484.00", "currency": "PLN"}, "created_at": "2026-10-03T14:07:05Z",
+        }
+        request = seen["request"]
+        assert request.url.path == "/rest/v1/rpc/create_order" and request.headers["content-profile"] == "shops"
+        args = json.loads(request.content)
+        assert args["p_expected_minor"] == 11800 and args["p_expected_currency"] == "PLN" and args["p_quantity"] == 38
+        assert args["p_decrement_stock"] is True and args["p_on_behalf_of"] == "agent-1" and len(args["p_fingerprint"]) == 64
+        for key, status, code in (
+            ("key-err-00001", 409, "price_changed"), ("key-err-00002", 409, "insufficient_quantity"),
+            ("key-err-00003", 409, "idempotency_conflict"), ("key-err-00004", 404, "offer_not_found"),
+        ):
+            error_of(client.post("/orders", json=body, headers={**_auth(), "Idempotency-Key": key}), status, code)
+
+
+def test_rest_key_is_sent_as_apikey_and_only_jwts_as_bearer():
+    client, fake = _supabase_client(lambda req: _json([], **{"Content-Range": "*/0"}), key="sb_secret_abcdef")
+    with client:
+        client.get("/search", params={"sku": "X"}, headers=_auth())
+    assert fake.requests[0].headers["apikey"] == "sb_secret_abcdef" and "authorization" not in fake.requests[0].headers
+    jwt = "aaa.bbb.ccc"
+    client, fake = _supabase_client(lambda req: _json([], **{"Content-Range": "*/0"}), key=jwt)
+    with client:
+        client.get("/search", params={"sku": "X"}, headers=_auth())
+    assert fake.requests[0].headers["apikey"] == jwt and fake.requests[0].headers["authorization"] == f"Bearer {jwt}"
+
+
+def test_rest_scenario_loader_posts_the_payload_and_handles_unknown_ids():
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return _json({"scenario_id": "foreign_cheapest", "merchants_loaded": 4, "offers_loaded": 6})
+
+    client, fake = _supabase_client(handler)
+    with client:
+        r = client.post("/admin/scenarios/foreign_cheapest/load", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"})
+        assert r.status_code == 200 and r.json() == {"scenario_id": "foreign_cheapest", "merchants_loaded": 4, "offers_loaded": 6}
+        assert fake.requests[0].url.path == "/rest/v1/rpc/load_scenario"
+        assert len(seen["body"]["p_merchants"]) == 4 and len(seen["body"]["p_offers"]) == 6
+        error_of(client.post("/admin/scenarios/nope/load", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}), 404, "scenario_not_found")
+        assert len(fake.requests) == 1
+
+
+def test_rest_readiness_and_failure_modes():
+    state = {"revision": MARKETPLACE_HEAD_REVISION, "merchants": 5}
+
+    def handler(request):
+        if request.url.path == "/rest/v1/alembic_version":
+            return _json([{"version_num": state["revision"]}])
+        return _json([], **{"Content-Range": f"*/{state['merchants']}"})
+
+    client, _ = _supabase_client(handler)
+    with client:
+        assert client.get("/health/ready").json() == {"status": "ready", "schema_revision": MARKETPLACE_HEAD_REVISION}
+        state["revision"] = "m0001"
+        error_of(client.get("/health/ready"), 503, "not_ready")
+        state.update(revision=MARKETPLACE_HEAD_REVISION, merchants=0)
+        error_of(client.get("/health/ready"), 503, "not_ready")
+
+    schema_hidden = lambda req: _json({"code": "PGRST106", "message": "Invalid schema: shops", "details": None, "hint": None}, 406)
+    client, _ = _supabase_client(schema_hidden)
+    with client:
+        err = error_of(client.get("/health/ready"), 503, "not_ready")
+        assert "expose-api" in err["message"]
+
+    def unreachable(request):
+        raise httpx.ConnectError("boom", request=request)
+
+    client, _ = _supabase_client(unreachable)
+    with client:
+        error_of(client.get("/search", params={"sku": "X"}, headers=_auth()), 503, "db_unavailable")
+    client, _ = _supabase_client(lambda req: _json({"message": "Bad gateway", "code": "502"}, 502))
+    with client:
+        error_of(client.get("/search", params={"sku": "X"}, headers=_auth()), 503, "db_unavailable")
+    client, _ = _supabase_client(lambda req: _json({"code": "42P01", "message": "relation does not exist"}, 404))
+    with client:
+        error_of(client.get("/search", params={"sku": "X"}, headers=_auth()), 500, "internal_error")

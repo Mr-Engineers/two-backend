@@ -10,6 +10,7 @@
 x-shop: &shop
   build: .
   image: office-shops:local
+  command: ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
   restart: unless-stopped
   depends_on:
     bootstrap:
@@ -74,7 +75,10 @@ services:
     command: ["uvicorn", "app.marketplace.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       APP_ENV: development
-      MARKETPLACE_DATABASE_URL: ${MARKETPLACE_DATABASE_URL:?missing - run gen-credentials}
+      # Data source: SUPABASE_URL + SUPABASE_KEY (REST, wins when set) or MARKETPLACE_DATABASE_URL (direct SQL).
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_KEY: ${SUPABASE_KEY:-}
+      MARKETPLACE_DATABASE_URL: ${MARKETPLACE_DATABASE_URL:-}
       MARKETPLACE_API_TOKEN: ${MARKETPLACE_API_TOKEN:-}
       MARKETPLACE_ADMIN_TOKEN: ${MARKETPLACE_ADMIN_TOKEN:-}
       MARKETPLACE_ENABLE_ADMIN: ${MARKETPLACE_ENABLE_ADMIN:-true}

@@ -119,6 +119,14 @@ def cmd_migrate(_: argparse.Namespace) -> None:
     print("Migrations applied and runtime grants refreshed.")
 
 
+def cmd_expose_api(_: argparse.Namespace) -> None:
+    result = dbadmin.expose_api_schemas(_require_env("MIGRATION_DATABASE_URL"))
+    if result is None:
+        print("No Supabase 'authenticator' role found: nothing to expose (plain PostgreSQL).")
+    else:
+        print(f"Data API exposed schemas: {result}")
+
+
 def _shops(selected: str | None) -> list[str]:
     return [selected] if selected else list(SHOPS)
 
@@ -196,6 +204,10 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("print-setup-sql", help="SQL for the Supabase SQL editor").set_defaults(func=cmd_print_setup_sql)
     sub.add_parser("setup-db", help="create schemas and runtime roles").set_defaults(func=cmd_setup_db)
     sub.add_parser("migrate", help="alembic upgrade head for all schemas + grants").set_defaults(func=cmd_migrate)
+
+    sub.add_parser(
+        "expose-api", help="add shops + warehouse to the Supabase Data API (needed for SUPABASE_URL/SUPABASE_KEY mode)"
+    ).set_defaults(func=cmd_expose_api)
 
     p = sub.add_parser("seed", help="idempotent seed (shops + marketplace base catalog if empty)")
     p.add_argument("--shop", choices=[*SHOPS, dbadmin.MARKETPLACE_ID])

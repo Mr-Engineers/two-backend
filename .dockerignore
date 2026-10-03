@@ -1,0 +1,11 @@
+.git
+.venv
+.pgdata
+.pgtest_probe
+.pytest_cache
+**/__pycache__
+.env
+.env.*
+!.env.example
+tests
+docs

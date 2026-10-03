@@ -11,14 +11,14 @@ from datetime import datetime, timezone
 from typing import Any, Callable, TypeVar
 
 from sqlalchemy import exc as sa_exc
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
 
 from app.db.session import Database
 from app.marketplace import MARKETPLACE_HEAD_REVISION, MARKETPLACE_SCHEMA
 from app.marketplace.config import MarketplaceSettings
 from app.marketplace.errors import MarketplaceError
-from app.marketplace.models import IdempotencyRecord, Merchant, Offer, Order
+from app.marketplace.models import MERCHANT_TABLES, IdempotencyRecord, Merchant, Offer, Order, offers_table
 from app.marketplace.schemas import (
     MerchantOut,
     MerchantRef,
@@ -62,7 +62,7 @@ def _offer_out(offer: Offer, merchant: Merchant) -> OfferOut:
         offer_id=offer.id,
         merchant=MerchantRef(id=merchant.id, name=merchant.name, domain=merchant.domain),
         product=ProductRef(sku=offer.sku, name=offer.product_name),
-        unit_price=Money.from_minor(offer.unit_price_minor, offer.currency),
+        unit_price=Money.from_minor(offer.unit_price_minor, offer.currency.strip()),
         available_qty=offer.available_qty,
         ships_from=offer.ships_from,
         delivery_days=offer.delivery_days,
@@ -141,7 +141,12 @@ class MarketplaceService:
                 raise MarketplaceError("not_ready", "Database schema is not migrated.") from None
             if revision != MARKETPLACE_HEAD_REVISION:
                 raise MarketplaceError("not_ready", "Database schema revision mismatch.")
-            merchants = session.scalar(select(func.count()).select_from(Merchant)) or 0
+            merchants = (
+                session.scalar(
+                    select(func.count()).select_from(Merchant).where(Merchant.id.in_(list(MERCHANT_TABLES)))
+                )
+                or 0
+            )
             if merchants == 0:
                 raise MarketplaceError("not_ready", "No scenario loaded; run the seed or POST /admin/scenarios/happy_path/load.")
             return {"status": "ready", "schema_revision": revision}
@@ -151,13 +156,13 @@ class MarketplaceService:
     # ------------------------------------------------------------------ reads
     def search(self, *, sku: str | None, q: str | None, limit: int) -> SearchResponse:
         def fn(session: Session) -> SearchResponse:
-            stmt = select(Offer, Merchant).join(Merchant, Offer.merchant_id == Merchant.id)
+            stmt = select(Offer, Merchant).join(Merchant, Offer.merchant_id == Merchant.id).where(Offer.active.is_(True))
             if sku is not None:
                 stmt = stmt.where(Offer.sku == sku)
             if q is not None:
                 stmt = stmt.where(Offer.product_name.ilike(_like_pattern(q), escape="\\"))
             total = session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-            rows = session.execute(stmt.order_by(Offer.unit_price_minor, Offer.id).limit(limit)).all()
+            rows = session.execute(stmt.order_by(Offer.unit_price, Offer.id).limit(limit)).all()
             return SearchResponse(offers=[_offer_out(o, m) for o, m in rows], total=total)
 
         return self._run(fn)
@@ -165,7 +170,9 @@ class MarketplaceService:
     def get_offer(self, offer_id: str) -> OfferOut:
         def fn(session: Session) -> OfferOut:
             row = session.execute(
-                select(Offer, Merchant).join(Merchant, Offer.merchant_id == Merchant.id).where(Offer.id == offer_id)
+                select(Offer, Merchant)
+                .join(Merchant, Offer.merchant_id == Merchant.id)
+                .where(Offer.id == offer_id, Offer.active.is_(True))
             ).first()
             if row is None:
                 raise MarketplaceError("offer_not_found", f"Offer {offer_id} does not exist")
@@ -179,8 +186,8 @@ class MarketplaceService:
             if m is None:
                 raise MarketplaceError("merchant_not_found", f"Merchant {merchant_id} does not exist")
             reputation = None
-            if m.reputation_score is not None and m.reputation_reviews_count is not None:
-                reputation = Reputation(score=float(m.reputation_score), reviews_count=m.reputation_reviews_count)
+            if m.reputation_score is not None:
+                reputation = Reputation(score=float(m.reputation_score), reviews_count=m.reviews_count)
             return MerchantOut(
                 id=m.id, name=m.name, domain=m.domain, country=m.country,
                 domain_registered_at=m.domain_registered_at, verified=m.verified, reputation=reputation,
@@ -203,17 +210,25 @@ class MarketplaceService:
                 assert existing is not None  # FK guarantees it
                 return _order_out(existing)
 
-            stmt = select(Offer).where(Offer.id == body.offer_id)
-            if self.settings.marketplace_decrement_stock:
-                stmt = stmt.with_for_update()
-            offer = session.scalar(stmt)
+            # ``shops.offers`` is a UNION view (no row locks); stock is decremented atomically below.
+            offer = session.scalar(select(Offer).where(Offer.id == body.offer_id, Offer.active.is_(True)))
             if offer is None:
                 raise MarketplaceError("offer_not_found", f"Offer {body.offer_id} does not exist")
             expected = body.expected_unit_price
-            if expected.currency != offer.currency or expected.minor != offer.unit_price_minor:
+            if expected.currency != offer.currency.strip() or expected.minor != offer.unit_price_minor:
                 raise MarketplaceError("price_changed")
             if body.quantity > offer.available_qty:
                 raise MarketplaceError("insufficient_quantity")
+            if self.settings.marketplace_decrement_stock:
+                table = offers_table(MERCHANT_TABLES[offer.merchant_id])
+                updated = session.execute(
+                    update(table)
+                    .where(table.c.offer_id == offer.id, table.c.available_qty >= body.quantity)
+                    .values(available_qty=table.c.available_qty - body.quantity)
+                    .returning(table.c.offer_id)
+                ).first()
+                if updated is None:  # a concurrent order took the stock
+                    raise MarketplaceError("insufficient_quantity")
 
             created_at = self.clock().astimezone(timezone.utc).replace(microsecond=0)
             order = Order(
@@ -233,8 +248,6 @@ class MarketplaceService:
             session.add(order)
             session.flush()
             session.add(IdempotencyRecord(idempotency_key=idempotency_key, request_fingerprint=fingerprint, order_id=order.id))
-            if self.settings.marketplace_decrement_stock:
-                offer.available_qty -= body.quantity
             session.flush()
             audit_logger.info(
                 "order_created",

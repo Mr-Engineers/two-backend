@@ -18,7 +18,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from app.config import normalize_database_url
-from app.marketplace import MARKETPLACE_DEV_PORT, MARKETPLACE_ROLE, MARKETPLACE_SCHEMA
+from app.marketplace import MARKETPLACE_DEV_PORT, MARKETPLACE_ROLE, MARKETPLACE_SCHEMA, SUPPLIERS_SCHEMA
+from app.marketplace.models import MERCHANT_TABLES
 from app.shops import SHOPS, ShopDefinition
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -148,14 +149,15 @@ MARKETPLACE_ID = "marketplace"
 
 # The marketplace runtime role may only change what the API needs: orders + idempotency records are insert-only,
 # available_qty is the only offer column that may be updated, merchants/offers can be replaced by the demo loader.
+# Offers live in one table per merchant (``MERCHANT_TABLES``); ``offers`` is the read-only UNION view over them.
+# Merchant profiles are ``warehouse.suppliers`` (owned by the warehouse team; shared access, see grants below).
 MARKETPLACE_RUNTIME_GRANTS: dict[str, str] = {
     "alembic_version": "SELECT",
-    "merchants": "SELECT, INSERT, DELETE",
-    "offers": "SELECT, INSERT, DELETE",
+    "offers": "SELECT",
     "orders": "SELECT, INSERT",
     "idempotency_records": "SELECT, INSERT",
+    **{table: "SELECT, INSERT, DELETE" for table in MERCHANT_TABLES.values()},
 }
-
 
 def _marketplace_shop_like() -> ShopDefinition:
     """The marketplace schema/role reuse the shop role+schema DDL; only the names differ."""
@@ -171,16 +173,63 @@ def marketplace_setup_statements(password: str | None, *, placeholder: bool = Fa
 
 
 def marketplace_grants_statements() -> list[str]:
-    s, r = MARKETPLACE_SCHEMA, MARKETPLACE_ROLE
-    stmts = _baseline_grant_statements(s, r)
+    """Grants on the SHARED ``shops`` / ``warehouse`` schemas.
+
+    Unlike the per-shop schemas nothing is revoked from PUBLIC or from the Supabase roles here: the ``shops`` and
+    ``warehouse`` schemas belong to other teams (``service_role`` has its own grants). Only the marketplace role's
+    own privileges are reset and re-granted.
+    """
+    s, w, r = MARKETPLACE_SCHEMA, SUPPLIERS_SCHEMA, MARKETPLACE_ROLE
+    stmts = [
+        f'REVOKE ALL ON ALL TABLES IN SCHEMA "{s}" FROM "{r}"',
+        f'REVOKE ALL ON ALL TABLES IN SCHEMA "{w}" FROM "{r}"',
+        f'GRANT USAGE ON SCHEMA "{s}" TO "{r}"',
+        f'GRANT USAGE ON SCHEMA "{w}" TO "{r}"',
+    ]
     for table, privileges in MARKETPLACE_RUNTIME_GRANTS.items():
         stmts.append(f'GRANT {privileges} ON "{s}"."{table}" TO "{r}"')
-    stmts.append(f'GRANT UPDATE (available_qty) ON "{s}"."offers" TO "{r}"')
+    for table in MERCHANT_TABLES.values():
+        stmts.append(f'GRANT UPDATE (available_qty) ON "{s}"."{table}" TO "{r}"')
+    # The demo loader upserts merchant profiles (ON CONFLICT DO UPDATE needs UPDATE on the written columns).
+    stmts.append(f'GRANT SELECT, INSERT, DELETE ON "{w}"."suppliers" TO "{r}"')
+    stmts.append(
+        f'GRANT UPDATE (name, domain, country, domain_registered_at, verified, reputation_score, reviews_count, '
+        f'offers_table, scenario_id) ON "{w}"."suppliers" TO "{r}"'
+    )
     return stmts
-
 
 def apply_marketplace_grants(admin_url: str) -> None:
     _run_statements(admin_url, marketplace_grants_statements())
+
+
+API_SCHEMAS = (MARKETPLACE_SCHEMA, SUPPLIERS_SCHEMA)
+
+
+def expose_api_schemas(admin_url: str) -> str | None:
+    """Add ``shops`` and ``warehouse`` to the Supabase Data API's exposed schemas (needed for SUPABASE_URL mode).
+
+    Sets ``pgrst.db_schemas`` on the ``authenticator`` role (what the dashboard's *Exposed schemas* edits) and asks
+    PostgREST to reload. Existing entries are kept. Returns the resulting list, or ``None`` when the database has
+    no ``authenticator`` role (plain PostgreSQL, nothing to do). The tables stay closed to ``anon`` /
+    ``authenticated``: they hold no grants there; only ``service_role`` (SUPABASE_KEY) can read and write.
+    """
+    url = normalize_database_url(admin_url).replace("postgresql+psycopg://", "postgresql://", 1)
+    with psycopg.connect(url, autocommit=True) as conn:
+        if conn.execute("SELECT 1 FROM pg_roles WHERE rolname = 'authenticator'").fetchone() is None:
+            return None
+        row = conn.execute(
+            "SELECT s FROM pg_db_role_setting d JOIN pg_roles r ON r.oid = d.setrole, unnest(d.setconfig) s "
+            "WHERE r.rolname = 'authenticator' AND d.setdatabase = 0 AND s LIKE 'pgrst.db_schemas=%'"
+        ).fetchone()
+        current = [x.strip() for x in (row[0].split("=", 1)[1] if row else "public,graphql_public").split(",") if x.strip()]
+        merged = current + [s for s in API_SCHEMAS if s not in current]
+        if merged != current:
+            conn.execute(
+                pgsql.SQL("ALTER ROLE authenticator SET pgrst.db_schemas = {}").format(pgsql.Literal(",".join(merged)))
+            )
+        conn.execute("NOTIFY pgrst, 'reload config'")
+        conn.execute("NOTIFY pgrst, 'reload schema'")
+        return ",".join(merged)
 
 
 def migrate_marketplace(admin_url: str) -> None:

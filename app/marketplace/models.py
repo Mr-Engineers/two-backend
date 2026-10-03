@@ -1,18 +1,28 @@
-"""Marketplace tables. They carry no schema: ``schema_translate_map`` binds them to ``marketplace``.
+"""Marketplace tables.
 
-Money is stored as integer minor units (2 decimal places, as in the contract) plus an ISO 4217 code.
-Orders keep a snapshot of the offer and do not reference the offer/merchant tables, so loading another demo
-scenario (which replaces merchants and offers) never breaks existing orders.
+Layout (shared Supabase project):
+
+* ``warehouse.suppliers``       - merchant profiles (the ORM class ``Merchant``),
+* ``shops.<merchant>``          - one offers table per merchant (``offers_table(name)``; written by the demo loader),
+* ``shops.offers``              - read-only UNION ALL view over all merchant tables (the ORM class ``Offer``),
+* ``shops.orders`` / ``shops.idempotency_records`` - created by this service (Alembic ``migrations_marketplace``).
+
+Tables without an explicit schema are bound to ``shops`` by ``schema_translate_map``.
+Prices in the merchant tables are decimal ``numeric`` (2 places); orders keep integer minor units.
+Orders keep a snapshot of the offer and do not reference offers/merchants, so reloading a demo scenario
+(which replaces merchants and offers) never breaks existing orders.
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Column,
     Date,
     DateTime,
     ForeignKey,
@@ -21,10 +31,14 @@ from sqlalchemy import (
     MetaData,
     Numeric,
     String,
+    Table,
     Text,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from app.marketplace import SUPPLIERS_SCHEMA
 
 NAMING = {
     "ix": "ix_%(table_name)s_%(column_0_N_name)s",
@@ -34,9 +48,52 @@ NAMING = {
     "pk": "pk_%(table_name)s",
 }
 
-# Upper bounds keep unit_price_minor * quantity far below the BIGINT limit.
-MAX_UNIT_PRICE_MINOR = 10**10
+# merchant_id -> its offers table in the ``shops`` schema (stored in ``warehouse.suppliers.offers_table``).
+# The first five tables were created by the shops team; the others are created by the migration.
+MERCHANT_TABLES: dict[str, str] = {
+    "mer_biuromax": "biuromax",
+    "mer_ofistorg": "ofistorg",
+    "mer_cheapdeals": "cheapdeals",
+    "mer_officehub": "officehub",
+    "mer_printworks": "printworks",
+    "mer_papiernik": "papiernik",
+    "mer_promocje": "promocje",
+    "mer_papierhurt": "papierhurt",
+    "mer_tonerfix": "tonerfix",
+}
+OFFER_COLUMNS = (
+    "offer_id", "merchant_id", "sku", "product_name", "unit_price", "currency", "available_qty",
+    "ships_from", "delivery_days", "description", "scenario_id", "active",
+)
+MAX_UNIT_PRICE = Decimal("99999999.99")
 MAX_AVAILABLE_QTY = 10**7
+
+_write_metadata = MetaData()  # not part of MarketplaceBase: only used for INSERT/DELETE/UPDATE statements
+
+
+def offers_table(name: str) -> Table:
+    """Core definition of one merchant offers table (the name must be one of ``MERCHANT_TABLES.values()``)."""
+    if name not in MERCHANT_TABLES.values():
+        raise ValueError(f"Unknown offers table {name!r}")
+    existing = _write_metadata.tables.get(name)
+    if existing is not None:
+        return existing
+    return Table(
+        name,
+        _write_metadata,
+        Column("offer_id", Text, primary_key=True),
+        Column("merchant_id", Text, nullable=False),
+        Column("sku", Text, nullable=False),
+        Column("product_name", Text, nullable=False),
+        Column("unit_price", Numeric(12, 2), nullable=False),
+        Column("currency", String(3), nullable=False),
+        Column("available_qty", Integer, nullable=False),
+        Column("ships_from", String(2), nullable=False),
+        Column("delivery_days", Integer, nullable=False),
+        Column("description", Text, nullable=False),
+        Column("scenario_id", Text, nullable=True),
+        Column("active", Boolean, nullable=False, server_default=text("true")),
+    )
 
 
 class MarketplaceBase(DeclarativeBase):
@@ -44,52 +101,46 @@ class MarketplaceBase(DeclarativeBase):
 
 
 class Merchant(MarketplaceBase):
-    __tablename__ = "merchants"
-    __table_args__ = (
-        CheckConstraint("country ~ '^[A-Z]{2}$'", name="country_format"),
-        CheckConstraint(
-            "(reputation_score IS NULL) = (reputation_reviews_count IS NULL)", name="reputation_complete"
-        ),
-        CheckConstraint("reputation_score IS NULL OR reputation_score BETWEEN 0 AND 1", name="reputation_range"),
-        CheckConstraint(
-            "reputation_reviews_count IS NULL OR reputation_reviews_count >= 0", name="reviews_non_negative"
-        ),
-    )
+    """``warehouse.suppliers``."""
 
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    name: Mapped[str] = mapped_column(String(120), nullable=False)
-    domain: Mapped[str] = mapped_column(String(255), nullable=False)
+    __tablename__ = "suppliers"
+    __table_args__ = {"schema": SUPPLIERS_SCHEMA}
+
+    id: Mapped[str] = mapped_column("merchant_id", String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    domain: Mapped[str] = mapped_column(String, nullable=False)
     country: Mapped[str] = mapped_column(String(2), nullable=False)
     domain_registered_at: Mapped[date] = mapped_column(Date, nullable=False)
     verified: Mapped[bool] = mapped_column(Boolean, nullable=False)
     # NULL for new merchants without reviews (the API returns ``"reputation": null``).
-    reputation_score: Mapped[float | None] = mapped_column(Numeric(4, 3), nullable=True)
-    reputation_reviews_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reputation_score: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    reviews_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    offers_table: Mapped[str] = mapped_column(String, nullable=False)
+    scenario_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class Offer(MarketplaceBase):
-    __tablename__ = "offers"
-    __table_args__ = (
-        CheckConstraint(f"unit_price_minor BETWEEN 0 AND {MAX_UNIT_PRICE_MINOR}", name="price_range"),
-        CheckConstraint("currency ~ '^[A-Z]{3}$'", name="currency_format"),
-        CheckConstraint(f"available_qty BETWEEN 0 AND {MAX_AVAILABLE_QTY}", name="qty_range"),
-        CheckConstraint("ships_from ~ '^[A-Z]{2}$'", name="ships_from_format"),
-        CheckConstraint("delivery_days >= 0", name="delivery_days_non_negative"),
-        Index("ix_offers_sku_unit_price_minor", "sku", "unit_price_minor"),
-        Index("ix_offers_merchant_id", "merchant_id"),
-    )
+    """The read-only view ``shops.offers`` (UNION ALL of the merchant tables). Writes go to ``offers_table()``."""
 
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    merchant_id: Mapped[str] = mapped_column(ForeignKey("merchants.id"), nullable=False)
-    sku: Mapped[str] = mapped_column(String(64), nullable=False)
-    product_name: Mapped[str] = mapped_column(String(200), nullable=False)
-    unit_price_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    __tablename__ = "offers"
+
+    id: Mapped[str] = mapped_column("offer_id", String, primary_key=True)
+    merchant_id: Mapped[str] = mapped_column(String, nullable=False)
+    sku: Mapped[str] = mapped_column(String, nullable=False)
+    product_name: Mapped[str] = mapped_column(String, nullable=False)
+    unit_price: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     available_qty: Mapped[int] = mapped_column(Integer, nullable=False)
     ships_from: Mapped[str] = mapped_column(String(2), nullable=False)
     delivery_days: Mapped[int] = mapped_column(Integer, nullable=False)
     # Free text from the merchant. In the demo scenarios it may contain prompt injection or malicious commands.
     description: Mapped[str] = mapped_column(Text, nullable=False)
+    scenario_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+    @property
+    def unit_price_minor(self) -> int:
+        return int((self.unit_price * 100).to_integral_value())
 
 
 class Order(MarketplaceBase):
@@ -100,6 +151,7 @@ class Order(MarketplaceBase):
         CheckConstraint("unit_price_minor >= 0", name="price_non_negative"),
         CheckConstraint("total_minor = unit_price_minor * quantity", name="total_consistent"),
         Index("ix_orders_created_at", "created_at"),
+        Index("ix_orders_merchant_created", "merchant_id", "created_at"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
@@ -130,4 +182,5 @@ class IdempotencyRecord(MarketplaceBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
-MARKETPLACE_TABLES = tuple(MarketplaceBase.metadata.tables)
+# Tables created by this service's migration (the rest belongs to the shops / warehouse teams' DDL).
+MARKETPLACE_TABLES = ("orders", "idempotency_records")
