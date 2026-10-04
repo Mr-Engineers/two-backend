@@ -5,16 +5,31 @@ from __future__ import annotations
 import logging
 import re
 import secrets
+import uuid
 from typing import Annotated
 
+import httpx
 from fastapi import APIRouter, Depends, FastAPI, Header, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.marketplace.attacks import (
+    ExecuteRequest,
+    ExecuteResultOut,
+    ScenarioAttackOut,
+    ScenarioListItem,
+    build_attack,
+    classify_outcome,
+    list_scenarios,
+    order_body,
+    pick_draft,
+    scenario_offers,
+)
 from app.marketplace.errors import ERROR_CATALOG, MarketplaceError
 from app.marketplace.middleware import on_behalf_of_var
+from app.marketplace.scenarios import build_scenario
 from app.marketplace.schemas import (
     ErrorResponse,
     MerchantOut,
@@ -166,6 +181,151 @@ def get_merchant(merchant_id: Annotated[str, Path(min_length=1, max_length=64)],
 )
 def load_scenario(scenario_id: Annotated[str, Path(min_length=1, max_length=64)], service: Service) -> ScenarioLoadOut:
     return service.load_scenario(scenario_id)
+
+
+# --- Faulty-request catalog (docs/testing/proxy-effectiveness.md, level A) -------------------------------------
+# Read-only, derived from scenarios.py with no database access, so these work for both backends and without any
+# scenario loaded. They expose the "wadliwe zapytania" each scenario is designed to produce.
+
+
+@admin.get(
+    "/scenarios",
+    response_model=list[ScenarioListItem],
+    summary="List demo scenarios and their expected decision",
+)
+def list_scenario_catalog(service: Service) -> list[ScenarioListItem]:
+    return list_scenarios(service.clock().date())
+
+
+def _build_scenario_or_404(scenario_id: str, service: Service):
+    try:
+        return build_scenario(scenario_id, service.clock().date())
+    except KeyError:
+        raise MarketplaceError("scenario_not_found", f"Scenario {scenario_id} does not exist") from None
+
+
+@admin.get(
+    "/scenarios/{scenario_id}/offers",
+    response_model=SearchResponse,
+    summary="Offers a scenario would expose (preview, no DB write)",
+    responses={404: {"model": ErrorResponse, "description": "`scenario_not_found`."}},
+)
+def scenario_offers_preview(
+    scenario_id: Annotated[str, Path(min_length=1, max_length=64)],
+    service: Service,
+    sku: Annotated[str | None, Query(max_length=64)] = None,
+    q: Annotated[str | None, Query(max_length=100)] = None,
+    limit: Annotated[int, Query(ge=1, le=50)] = 50,
+) -> SearchResponse:
+    scenario = _build_scenario_or_404(scenario_id, service)
+    return scenario_offers(scenario, sku=(sku.strip() or None) if sku else None, q=(q.strip() or None) if q else None, limit=limit)
+
+
+@admin.get(
+    "/scenarios/{scenario_id}/attack",
+    response_model=ScenarioAttackOut,
+    summary="The faulty POST /orders request a manipulated agent would send",
+    responses={404: {"model": ErrorResponse, "description": "`scenario_not_found`."}},
+)
+def scenario_attack(
+    scenario_id: Annotated[str, Path(min_length=1, max_length=64)],
+    service: Service,
+    qty_needed: Annotated[int, Query(ge=1, le=2_147_483_647, description="Mandated restock quantity from GET /low-stock.")] = 40,
+) -> ScenarioAttackOut:
+    scenario = _build_scenario_or_404(scenario_id, service)
+    try:
+        return build_attack(scenario, qty_needed)
+    except KeyError as exc:
+        raise MarketplaceError("internal_error", str(exc)) from None
+
+
+@admin.post(
+    "/scenarios/{scenario_id}/execute",
+    response_model=ExecuteResultOut,
+    summary="Place the scenario's faulty order (blocked by the proxy, executed without it)",
+    responses={
+        404: {"model": ErrorResponse, "description": "`scenario_not_found`."},
+        422: {"model": ErrorResponse, "description": "`validation_error` (clean scenario, or no target configured)."},
+    },
+)
+def execute_scenario_attack(
+    scenario_id: Annotated[str, Path(min_length=1, max_length=64)],
+    request: Request,
+    service: Service,
+    body: ExecuteRequest | None = None,
+) -> ExecuteResultOut:
+    """Build the faulty ``POST /orders`` for the scenario and actually send it to a target.
+
+    The order is sent as a real HTTP request to ``{base}/orders``. Point ``base`` at the proxy to see it blocked
+    (``403`` → ``DENY``) and at the marketplace directly to see the attack go through (``201`` → executed). The
+    target is admin-supplied, so this route is only mounted behind the admin token (and ``marketplace_enable_admin``).
+    """
+    settings = request.app.state.settings
+    payload = body or ExecuteRequest()
+    scenario = _build_scenario_or_404(scenario_id, service)
+    try:
+        attack = build_attack(scenario, payload.qty_needed)
+        draft = pick_draft(attack, payload.use)
+    except KeyError as exc:
+        raise MarketplaceError("internal_error", str(exc)) from None
+    except ValueError as exc:
+        raise MarketplaceError("validation_error", str(exc)) from None
+
+    base = (payload.base_url or settings.attack_execute_base_url or "").rstrip("/")
+    if not base:
+        raise MarketplaceError(
+            "validation_error", "No target: set attack_execute_base_url or pass base_url (proxy or marketplace)."
+        )
+    if not base.startswith(("http://", "https://")):
+        raise MarketplaceError("validation_error", "base_url must be an http(s) URL.")
+    target = f"{base}/orders"
+
+    token = payload.bearer_token or (
+        settings.marketplace_api_token.get_secret_value() if settings.marketplace_api_token else None
+    )
+    headers = {"Content-Type": "application/json", "Idempotency-Key": uuid.uuid4().hex}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    def result(http_status: int, response_body: object) -> ExecuteResultOut:
+        outcome, interpretation = classify_outcome(http_status)
+        return ExecuteResultOut(
+            scenario_id=scenario.scenario_id,
+            expected_decision=scenario.expected_decision,
+            use=payload.use,
+            target=target,
+            sent_order=draft,
+            http_status=http_status,
+            outcome=outcome,
+            interpretation=interpretation,
+            response_body=response_body,
+        )
+
+    try:
+        with httpx.Client(timeout=settings.attack_execute_timeout, follow_redirects=True) as client:
+            resp = client.post(target, json=order_body(draft), headers=headers)
+    except httpx.HTTPError as exc:
+        return ExecuteResultOut(
+            scenario_id=scenario.scenario_id,
+            expected_decision=scenario.expected_decision,
+            use=payload.use,
+            target=target,
+            sent_order=draft,
+            http_status=0,
+            outcome="error",
+            interpretation=f"Target {target} unreachable: {type(exc).__name__}.",
+            response_body=str(exc),
+        )
+
+    try:
+        response_body: object = resp.json()
+    except ValueError:
+        response_body = resp.text
+    logger.info(
+        "scenario attack executed",
+        extra={"scenario_id": scenario.scenario_id, "target": target, "status": resp.status_code},
+    )
+    return result(resp.status_code, response_body)
 
 
 def install_error_handlers(app: FastAPI) -> None:

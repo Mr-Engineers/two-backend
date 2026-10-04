@@ -59,6 +59,11 @@ class MarketplaceSettings(BaseSettings):
     # Open question 2 of the contract: when true, a confirmed order lowers ``available_qty``;
     # when false (default) the stock stays constant, which keeps the demo repeatable.
     marketplace_decrement_stock: bool = False
+    # Default target for POST /admin/scenarios/{id}/execute: where the faulty order is sent (``{base}/orders``).
+    # Point it at the proxy (e.g. ``http://proxy:8080/apps/marketplace``) to see the order blocked, or at the
+    # marketplace itself (no proxy) to see the attack go through. A request body may override it per call.
+    attack_execute_base_url: str | None = None
+    attack_execute_timeout: float = Field(default=10.0, gt=0, le=60)
 
     db_pool_size: int = Field(default=5, ge=1, le=20)
     db_max_overflow: int = Field(default=5, ge=0, le=20)
